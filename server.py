@@ -27,15 +27,18 @@ API:
 Run: python3 intercom/server.py
 """
 
-import json, sqlite3, asyncio, time, sys, subprocess, html
+import json, sqlite3, asyncio, time, sys, subprocess, html, os
 from datetime import datetime, timedelta
 
-PORT = 7777
-DB_PATH = '/Users/Clawdio/.openclaw/workspace/intercom/intercom.db'
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(HERE, 'data')
+PORT = int(os.environ.get('INTERCOM_PORT', '7777'))
+DB_PATH = os.environ.get('INTERCOM_DB_PATH', os.path.join(DATA_DIR, 'intercom.db'))
 VALID_AGENTS = {'forge', 'lumino', 'bridger', 'claude', 'waverly', 'codex'}
 VALID_MSG_TYPES = {'msg', 'task', 'response', 'data', 'ping', 'pong'}
 MAX_BODY_LEN = 20000
 MAX_RPC_TIMEOUT = 300
+NOTIFY_COMMAND = os.environ.get('INTERCOM_NOTIFY_COMMAND', '').strip()
 
 # Agent notification events (asyncio) + connected WebSocket clients
 _agent_events: dict[str, asyncio.Event] = {}
@@ -46,6 +49,7 @@ START_TIME = time.time()
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -128,16 +132,19 @@ async def notify_agent(agent, message_dict=None):
             _ws_clients[agent].remove(ws)
 
 
-def _notify_lumino_openclaw(msg_id, body):
-    """Try to notify Lumino of a new message via OpenClaw CLI."""
+def _notify_external(msg_id, from_agent, to_agent, body):
+    """Optional hook for local desktop notifications or agent wakeups."""
+    if not NOTIFY_COMMAND:
+        return
     try:
-        preview = body[:200] if body else '(no body)'
-        subprocess.run(
-            ['openclaw', 'agent', '--agent', 'main', '--message',
-             f'[INTERCOM #{msg_id}] Message from Forge: {preview}\n\n'
-             f'To respond, run: python3 /Users/Clawdio/.openclaw/workspace/intercom/client.py '
-             f'respond {msg_id} "your response"'],
-            capture_output=True, text=True, timeout=120)
+        preview = (body or '(no body)')[:200]
+        cmd = NOTIFY_COMMAND.format(
+            msg_id=msg_id,
+            from_agent=from_agent,
+            to_agent=to_agent,
+            body=preview,
+        )
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120, shell=True)
     except Exception as e:
         print(f"Notification failed: {e}")
 
@@ -199,10 +206,9 @@ async def send_message(request):
     msg_dict = dict(row) if row else {'id': msg_id}
     await notify_agent(to_agent, msg_dict)
 
-    # Lumino OpenClaw notification
-    if to_agent == 'lumino' and msg_type in ('task', 'ping'):
+    if NOTIFY_COMMAND and msg_type in ('task', 'ping'):
         asyncio.get_event_loop().run_in_executor(
-            None, _notify_lumino_openclaw, msg_id, body)
+            None, _notify_external, msg_id, from_agent, to_agent, body)
 
     return JSONResponse({'id': msg_id, 'status': 'sent'})
 
@@ -346,9 +352,9 @@ async def rpc_call(request):
 
     await notify_agent(to_agent, dict(row) if row else None)
 
-    if to_agent == 'lumino':
+    if NOTIFY_COMMAND:
         asyncio.get_event_loop().run_in_executor(
-            None, _notify_lumino_openclaw, task_id, body)
+            None, _notify_external, task_id, from_agent, to_agent, body)
 
     # Wait for response
     deadline = time.time() + timeout

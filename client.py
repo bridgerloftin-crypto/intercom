@@ -20,11 +20,11 @@ Agent detection:
   - Codex sessions auto-detect as "codex" when CODEX_HOME is present
 """
 
-import sys, json, urllib.request, urllib.error
+import sys, json, urllib.request, urllib.error, os, subprocess
 
-BASE = 'http://localhost:7777'
+BASE = os.environ.get('INTERCOM_BASE', 'http://localhost:7777').rstrip('/')
 ME = None  # set based on context
-TASK_FIRST_AGENTS = {'forge', 'lumino', 'claude', 'waverly'}
+TASK_FIRST_AGENTS = {'forge', 'lumino', 'claude', 'waverly', 'codex'}
 
 
 def _post(path, data):
@@ -196,36 +196,23 @@ def history():
 
 def _detect_agent():
     """Detect which agent is running based on environment."""
-    import os
     if os.environ.get('INTERCOM_AGENT'):
         return os.environ['INTERCOM_AGENT'].lower()
     if os.environ.get('CODEX_HOME'):
         return 'codex'
-    codex_home = os.path.expanduser('~/.codex')
-    cwd = os.getcwd()
-    if os.path.isdir(codex_home) and (
-        cwd.startswith('/Users/Clawdio/Documents/Codex/')
-        or os.path.exists(os.path.join(codex_home, 'auth.json'))
-    ):
-        return 'codex'
     if os.environ.get('OPENCLAW_AGENT'):
         return os.environ['OPENCLAW_AGENT']
-    # Check if we're running inside OpenClaw's gateway
     ppid = os.getppid()
     try:
-        with open(f'/proc/{ppid}/cmdline', 'r') as f:
-            cmdline = f.read()
-            if 'openclaw' in cmdline.lower():
-                return 'lumino'
-    except:
-        pass
-    # Check parent process name on macOS
-    try:
-        import subprocess
-        result = subprocess.run(['ps', '-p', str(ppid), '-o', 'command='], capture_output=True, text=True, timeout=2)
-        if 'openclaw' in result.stdout.lower() or 'node' in result.stdout.lower():
+        result = subprocess.run(
+            ['ps', '-p', str(ppid), '-o', 'command='],
+            capture_output=True, text=True, timeout=2)
+        parent = result.stdout.lower()
+        if 'codex' in parent:
+            return 'codex'
+        if 'openclaw' in parent:
             return 'lumino'
-    except:
+    except Exception:
         pass
     return 'forge'
 

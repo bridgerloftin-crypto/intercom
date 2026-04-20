@@ -26,14 +26,23 @@ Intercom does that and very little else.
 - SQLite WAL persistence
 - browser UI for humans in the loop
 - simple Python CLI
-- optional daemon adapters for always-on agents
+- optional example daemon adapters for always-on agents
 - explicit message types so chat and work requests are not the same thing
 
-## Quick start
+## Install
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 server.py
+git clone https://github.com/bridgerloftin-crypto/intercom.git
+cd intercom
+./install.sh
+```
+
+That creates a local virtualenv, installs the minimal dependencies, and prepares a `data/` directory for the SQLite database.
+
+## Start
+
+```bash
+.venv/bin/python server.py
 ```
 
 Then open:
@@ -41,9 +50,18 @@ Then open:
 - UI: [http://localhost:7777](http://localhost:7777)
 - status: [http://localhost:7777/status](http://localhost:7777/status)
 
+## Quick test
+
+```bash
+INTERCOM_AGENT=bridger .venv/bin/python client.py send forge "hello"
+.venv/bin/python client.py status
+```
+
 ## Core model
 
 Agents post messages to `/send`. Recipients read from `/inbox/{agent}` or long-poll `/wait/{agent}`. WebSocket clients can subscribe at `/ws/{agent}` for instant push.
+
+By default, the server stores its SQLite database at `./data/intercom.db`. You can override that with `INTERCOM_DB_PATH`.
 
 ```bash
 # Send a task
@@ -72,15 +90,16 @@ Core pieces:
 - `server.py`
 - `client.py`
 - `intercom_logger.py`
+- `install.sh`
+- `.env.example`
 
-Example daemon adapters:
+Examples live under `examples/`:
 
-- `forge_daemon.py`
-- `claude_daemon.py`
-- `lumino_daemon.py`
-- `codex_daemon.py`
+- `examples/daemons/`
+- `examples/integrations/`
+- `examples/scripts/`
 
-These daemon files are intentionally opinionated examples from a real local setup. They include machine-specific paths and model/runtime assumptions. If you publish Intercom, treat them as examples, not the required core.
+They are templates, not required runtime. Configure them with environment variables for your own machine and models.
 
 ## Agent names
 
@@ -100,19 +119,19 @@ If you want a different set, edit `VALID_AGENTS` and restart the server.
 ## CLI examples
 
 ```bash
-python3 client.py send forge "Can you check the repo?"
-python3 client.py send forge --type task "Run the tests and summarize the result."
-python3 client.py inbox forge
-python3 client.py history
-python3 client.py status
-python3 client.py ping lumino
-python3 client.py ask forge "What changed in the last commit?"
+.venv/bin/python client.py send forge "Can you check the repo?"
+.venv/bin/python client.py send forge --type task "Run the tests and summarize the result."
+.venv/bin/python client.py inbox forge
+.venv/bin/python client.py history
+.venv/bin/python client.py status
+.venv/bin/python client.py ping lumino
+.venv/bin/python client.py ask forge "What changed in the last commit?"
 ```
 
-Codex sessions can auto-detect as `codex` when `CODEX_HOME` is present, or you can force identity manually:
+You can force identity manually:
 
 ```bash
-INTERCOM_AGENT=codex python3 client.py send forge "message"
+INTERCOM_AGENT=codex .venv/bin/python client.py send forge "message"
 ```
 
 ## Browser UI
@@ -128,8 +147,10 @@ Navigate to [http://localhost:7777](http://localhost:7777) for a browser-based i
 
 - do not commit `intercom.db` or its WAL files
 - do not commit machine-local logs
-- daemon adapters may contain local paths that should be generalized or moved into an `examples/` folder
-- launchd plists belong to the host machine, not necessarily the repo
+- keep host-specific launchd plists outside the repo
+- use environment variables for model paths, workspace paths, and credentials
+- copy `.env.example` or export env vars as needed
+- the server supports `INTERCOM_DB_PATH`, `INTERCOM_PORT`, and `INTERCOM_NOTIFY_COMMAND`
 
 ## License
 
