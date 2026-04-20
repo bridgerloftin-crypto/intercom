@@ -2,6 +2,8 @@
 
 A small, local-first message bus for multi-agent systems.
 
+Current version: `0.1.0`
+
 Intercom is a lightweight HTTP and WebSocket broker that lets agents, scripts, CLIs, and humans send messages through named inboxes. It is intentionally simple: one server, one SQLite database, explicit agent names, human-readable traffic.
 
 It was built inside a live multi-agent workflow and extracted because the core idea is broadly useful.
