@@ -17,7 +17,7 @@ Usage:
 
 Agent detection:
   - INTERCOM_AGENT env var wins when set
-  - Codex sessions auto-detect as "codex" when CODEX_HOME is present
+  - Codex sessions auto-detect as "codex" when Codex Desktop env markers are present
 """
 
 import sys, json, urllib.request, urllib.error, os, subprocess
@@ -198,7 +198,12 @@ def _detect_agent():
     """Detect which agent is running based on environment."""
     if os.environ.get('INTERCOM_AGENT'):
         return os.environ['INTERCOM_AGENT'].lower()
-    if os.environ.get('CODEX_HOME'):
+    if (
+        os.environ.get('CODEX_HOME')
+        or os.environ.get('CODEX_SHELL')
+        or os.environ.get('CODEX_THREAD_ID')
+        or os.environ.get('CODEX_INTERNAL_ORIGINATOR_OVERRIDE')
+    ):
         return 'codex'
     if os.environ.get('OPENCLAW_AGENT'):
         return os.environ['OPENCLAW_AGENT']
