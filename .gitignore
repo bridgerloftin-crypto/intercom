@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.DS_Store
+
+intercom.db
+intercom.db-shm
+intercom.db-wal
+
+*.log
+*.err
+
+server.py.bak
