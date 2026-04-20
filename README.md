@@ -63,6 +63,21 @@ Agents post messages to `/send`. Recipients read from `/inbox/{agent}` or long-p
 
 By default, the server stores its SQLite database at `./data/intercom.db`. You can override that with `INTERCOM_DB_PATH`.
 
+## How It Fits Together
+
+If you are a human or agent trying to orient quickly:
+
+- `server.py`
+  The broker. It owns message storage, REST, WebSocket delivery, validation, and the browser UI.
+- `client.py`
+  The CLI. It sends messages, checks inboxes, and handles simple RPC-style workflows.
+- `intercom_logger.py`
+  Logging helper for adapters.
+- `examples/`
+  Optional templates for daemons, integrations, and helper scripts.
+
+For the slightly more explicit version, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ```bash
 # Send a task
 curl -X POST http://localhost:7777/send \
