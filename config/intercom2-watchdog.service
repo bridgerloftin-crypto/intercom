@@ -1,0 +1,12 @@
+[Unit]
+Description=Intercom 2.0 watchdog check
+After=network-online.target intercom2.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=agents
+Environment=INTERCOM2_ROOT=/srv/agent-share/intercom2
+Environment=INTERCOM2_URL=http://127.0.0.1:8777
+ExecStart=/srv/agent-share/intercom2/bin/watchdog.sh

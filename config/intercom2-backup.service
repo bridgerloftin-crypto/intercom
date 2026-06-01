@@ -1,0 +1,11 @@
+[Unit]
+Description=Intercom 2.0 Postgres Backup
+Wants=postgresql.service
+After=postgresql.service srv-agent\x2dshare.mount
+
+[Service]
+Type=oneshot
+User=postgres
+Group=agents
+SupplementaryGroups=agents
+ExecStart=/srv/agent-share/intercom2/bin/backup.sh

@@ -1,0 +1,16 @@
+[Unit]
+Description=Intercom 2.0 agent poller for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/root/intercom2/%i.env
+EnvironmentFile=-/root/.openclaw/%i/intercom2.env
+EnvironmentFile=-/root/.openclaw/workspace/%i/intercom2.env
+EnvironmentFile=-/root/.openclaw/workspace/riff/intercom2.env
+EnvironmentFile=-/root/.openclaw/intercom2.env
+EnvironmentFile=-/root/.hermes/intercom2.env
+Environment=INTERCOM_AGENT=%i
+ExecStart=/usr/bin/python3 /root/intercom2/intercom2_poll_once.py
+

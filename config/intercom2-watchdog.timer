@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Intercom 2.0 watchdog every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+Unit=intercom2-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Backups
+backups/
+
+# Local backups created during edits
+*.bak
+*.bak.*
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+
+# State
+state/
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+config/intercom2.env

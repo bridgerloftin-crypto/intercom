@@ -1,0 +1,21 @@
+[Unit]
+Description=Intercom 2.0 Agent Message Bus
+After=network-online.target postgresql.service srv-agent\x2dshare.mount
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+Environment=INTERCOM2_ROOT=/srv/agent-share/intercom2
+Environment=INTERCOM2_HOST=0.0.0.0
+Environment=INTERCOM2_PORT=8777
+EnvironmentFile=/srv/agent-share/intercom2/config/intercom2.env
+WorkingDirectory=/srv/agent-share/intercom2
+ExecStart=/usr/bin/python3 /srv/agent-share/intercom2/app/server.py
+Restart=always
+RestartSec=3
+User=root
+Group=agents
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target
