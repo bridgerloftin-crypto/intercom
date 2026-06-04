@@ -406,6 +406,18 @@ def send_html(handler: BaseHTTPRequestHandler, body: bytes) -> None:
     handler.wfile.write(body)
 
 
+def _is_tls_deployment() -> bool:
+    """True when the deployment uses HTTPS at the edge.
+
+    The session cookie must set Secure when served over TLS (browsers
+    reject Secure cookies on http://). On our tailscale-internal
+    deployment we're plaintext, so Secure is omitted and the cookie
+    sticks anyway.
+    """
+    url = os.environ.get("INTERCOM2_URL", "http://100.65.136.76:8777")
+    return url.lower().startswith("https://")
+
+
 class Intercom2Handler(BaseHTTPRequestHandler):
     server_version = f"Intercom2/{APP_VERSION}"
 
@@ -499,6 +511,7 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             # and is unexpired, the user is considered authenticated.
             return row["name"]
 
+
     def _maybe_flush_session_cookie(self) -> None:
         """Called by response helpers to add the Set-Cookie header if pending.
 
@@ -522,7 +535,11 @@ class Intercom2Handler(BaseHTTPRequestHandler):
                     session_id = cur.fetchone()[0]
                 self.send_header(
                     "Set-Cookie",
-                    f"ic2_session={session_id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400",
+                    (
+                        f"ic2_session={session_id}; Path=/; HttpOnly;"
+                        f"{' Secure;' if _is_tls_deployment() else ''}"
+                        f" SameSite=Lax; Max-Age=86400"
+                    ),
                 )
             self._pending_new_session = None
 

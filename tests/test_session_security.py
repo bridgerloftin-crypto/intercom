@@ -70,9 +70,21 @@ def test_session_cookie_is_short_opaque_id():
     assert cookie_value != forge
 
 
-def test_cookie_has_secure_flag():
+def test_cookie_has_secure_flag_when_https():
+    """Secure flag is set when the deployment is HTTPS; omitted over http://.
+
+    Browsers reject Secure cookies on plaintext URLs, so on our
+    tailscale-internal HTTP deployment the flag is intentionally absent.
+    If INTERCOM2_URL starts with https://, Secure must be present.
+    """
     forge = _read_token("forge")
     assert forge
     status, set_cookie = _http("GET", "/", forge)
     assert status == 200 and "ic2_session=" in set_cookie
-    assert "Secure" in set_cookie, f"Missing Secure flag: {set_cookie[:200]}"
+    if SERVER_URL.lower().startswith("https://"):
+        assert "Secure" in set_cookie, f"Missing Secure flag: {set_cookie[:200]}"
+    else:
+        assert "Secure" not in set_cookie, (
+            f"Secure flag set on plaintext URL — browsers will reject it. "
+            f"Set-Cookie: {set_cookie[:200]}"
+        )
