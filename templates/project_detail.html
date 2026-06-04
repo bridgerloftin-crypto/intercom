@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · Intercom 2.0{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">{{ project.name }}</h2>
+      <span class="section-note">{{ project.state|default('—') }}</span>
+    </header>
+
+    <dl class="project-meta">
+      <div>
+        <dt>description</dt>
+        <dd>{{ project.description|default('—') }}</dd>
+      </div>
+      <div>
+        <dt>default owner</dt>
+        <dd>{{ project.default_owner|default('— unassigned —') }}</dd>
+      </div>
+      <div>
+        <dt>coding</dt>
+        <dd>{{ project.coding|default('— unassigned —') }}</dd>
+      </div>
+      <div>
+        <dt>reviewing</dt>
+        <dd>{{ project.reviewing|default('— unassigned —') }}</dd>
+      </div>
+      <div>
+        <dt>last commit</dt>
+        <dd>
+          {% if project.last_commit %}<code>{{ project.last_commit }}</code>{% endif %}
+          {{ project.last_commit_age|default('') }}
+        </dd>
+      </div>
+      <div>
+        <dt>unread for you</dt>
+        <dd>{{ project.unread_for_you|default(0) }}</dd>
+      </div>
+    </dl>
+  </div>
+</section>
+
+{% if recent_messages %}
+<section class="section">
+  <div class="section-num">§2</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Recent activity</h2>
+      <span class="section-count">{{ recent_messages|length }}</span>
+    </header>
+    <ul class="action-list">
+      {% for m in recent_messages %}
+      <li class="action-row" data-thread="{{ m.thread_id|default(m.id) }}">
+        <div class="action-meta">
+          <span>{{ m.from_agent }} → {{ m.to_agent }}</span>
+          <span>{{ m.created_at }}</span>
+        </div>
+        <div class="action-subject">{{ m.subject|default('(no subject)') }}</div>
+        <a class="action-cta" href="/threads/{{ m.thread_id|default(m.id) }}">open</a>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

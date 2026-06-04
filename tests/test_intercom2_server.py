@@ -31,6 +31,13 @@ import intercom2_server  # noqa: F401
 # ── Helper function tests ────────────────────────────────────────────
 
 
+class _FakeBase:
+    def auth_cookie(self): return None
+    def _agent_from_session(self, session_id): return None
+    def _agent_from_token(self, token): return None
+    def _do_GET_inner(self): return intercom2_server.Intercom2Handler._do_GET_inner(self)
+    def _do_POST_inner(self): return intercom2_server.Intercom2Handler._do_POST_inner(self)
+
 def test_valid_agent_name_accepts_lowercase():
     assert intercom2_server.valid_agent_name("codex") is True
     assert intercom2_server.valid_agent_name("forge") is True
@@ -85,7 +92,7 @@ def _make_handler_with_rfile(headers, body):
 
 
 def test_read_payload_capped_rejects_oversize():
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self):
             self.headers = {"Content-Length": "99999999", "Content-Type": "application/json"}
             self.rfile = type("R", (), {"read": lambda self, n: b""})()
@@ -94,7 +101,7 @@ def test_read_payload_capped_rejects_oversize():
 
 
 def test_read_payload_capped_accepts_form():
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self, body):
             self.headers = {"Content-Length": str(len(body)), "Content-Type": "application/x-www-form-urlencoded"}
             self.rfile = type("R", (), {"read": lambda self, n: body})()
@@ -104,7 +111,7 @@ def test_read_payload_capped_accepts_form():
 
 def test_read_payload_capped_accepts_json():
     body = b'{"key": "value"}'
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self, b):
             self.headers = {"Content-Length": str(len(b)), "Content-Type": "application/json"}
             self.rfile = type("R", (), {"read": lambda self, n: b})()
@@ -114,7 +121,7 @@ def test_read_payload_capped_accepts_json():
 
 def test_read_payload_capped_rejects_bad_json():
     body = b"not json"
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self, b):
             self.headers = {"Content-Length": str(len(b)), "Content-Type": "application/json"}
             self.rfile = type("R", (), {"read": lambda self, n: b})()
@@ -148,7 +155,7 @@ def test_pool_lazy_init():
 
 def _make_inbox_handler(path, actor="codex"):
     """A handler with all HTTP methods stubbed."""
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self, p, a):
             self.path = p
             self.headers = {}
@@ -233,7 +240,7 @@ def test_inbox_validates_through_actor_not_url_path(monkeypatch):
 
 def test_authorized_agent_rejects_when_no_token(monkeypatch):
     """No token presented → None (no DB hit)."""
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self):
             self.headers = {}
             self.path = "/api/health"
@@ -261,7 +268,7 @@ def test_authorized_agent_rejects_expired_token(monkeypatch):
 
     monkeypatch.setattr(intercom2_server, "connect", fake_connect)
     monkeypatch.setattr(intercom2_server, "get_bootstrap_token", lambda: None)
-    class FakeHandler:
+    class FakeHandler(_FakeBase):
         def __init__(self):
             self.headers = {"Authorization": "Bearer expired_token"}
             self.path = "/api/health"

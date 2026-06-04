@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}{{ thread.title|truncate(60) }} · Intercom 2.0{% endblock %}
+{% block content %}
+
+<header class="page-header">
+  <h1 class="page-title">{{ thread.title|truncate(80) }}</h1>
+  <div class="page-subtitle">
+    <div><strong>{{ messages|length }}</strong> message{{ '' if messages|length == 1 else 's' }}</div>
+    <div>{{ thread.project|default('—') }} · {{ thread.status|default('open') }}</div>
+  </div>
+</header>
+
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Conversation</h2>
+      <span class="section-note">chronological</span>
+    </header>
+
+    <article class="thread">
+      {% for m in messages %}
+      <section class="thread-msg" data-from="{{ m.from_agent }}">
+        <header class="thread-msg-head">
+          <div class="thread-msg-author">
+            <span class="author-name">{{ m.from_agent }}</span>
+            <span class="author-arrow">→</span>
+            <span class="author-to">{{ m.to_agent }}</span>
+          </div>
+          <div class="thread-msg-meta">
+            <time>{{ m.created_at }}</time>
+            {% if m.priority and m.priority != 'normal' %}
+            <span class="priority priority-{{ m.priority }}">{{ m.priority }}</span>
+            {% endif %}
+          </div>
+        </header>
+        {% if m.subject and not loop.first %}
+        <div class="thread-msg-subject">{{ m.subject }}</div>
+        {% endif %}
+        <div class="thread-msg-body">{{ m.body|default('') }}</div>
+      </section>
+      {% endfor %}
+    </article>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-num">§2</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Reply</h2>
+      <span class="section-note">as <em>{{ actor }}</em></span>
+    </header>
+
+    <form class="reply-form" method="post" action="/ui/send">
+      <input type="hidden" name="thread_id" value="{{ thread.id }}">
+      <input type="hidden" name="from_agent" value="{{ actor }}">
+
+      <div class="form-row">
+        <label for="reply-to">To</label>
+        <input type="text" id="reply-to" name="to_agent" value="{{ messages[-1].from_agent }}" required>
+      </div>
+
+      <div class="form-row">
+        <label for="reply-subject">Subject</label>
+        <input type="text" id="reply-subject" name="subject" placeholder="Re: {{ thread.title|truncate(50) }}" required>
+      </div>
+
+      <div class="form-row">
+        <label for="reply-body">Message</label>
+        <textarea id="reply-body" name="body" rows="6" placeholder="Type your reply. Plain text. Markdown not rendered." required></textarea>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit">Send reply</button>
+        <a class="action-cta is-quiet" href="/inbox">back to inbox</a>
+        <span class="form-shortcut"><span class="kbd">⌘</span> <span class="kbd">↵</span> to send</span>
+      </div>
+    </form>
+  </div>
+</section>
+
+{% endblock %}

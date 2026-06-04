@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Today · Intercom 2.0{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/static/main.css">
+  <meta name="robots" content="noindex">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="masthead">
+    <div class="masthead-left">
+      <span class="masthead-mark">IC2</span>
+      <span class="masthead-sep">/</span>
+      <span class="masthead-section">{{ section_title|default('Today') }}</span>
+    </div>
+    <nav class="masthead-nav">
+      <a href="/" {% if section_title == "Today" %}aria-current="page"{% endif %}>Today</a>
+      <a href="/inbox" {% if section_title == "Inbox" %}aria-current="page"{% endif %}>Inbox</a>
+      <a href="/projects" {% if section_title == "Projects" %}aria-current="page"{% endif %}>Projects</a>
+      <a href="/handoffs" {% if section_title == "Handoffs" %}aria-current="page"{% endif %}>Handoffs</a>
+      <a href="/health" {% if section_title == "Health" %}aria-current="page"{% endif %}>Health</a>
+    </nav>
+    <div class="masthead-right">
+      {% include "_project_picker.html" %}
+      <span class="agent-pill">{{ actor|default('bridger') }} · online</span>
+    </div>
+  </header>
+
+  <main class="page">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <span><span class="footer-pulse"></span>Intercom 2.0 · {{ version|default("0.6.1") }} · {{ uptime|default("11h") }} uptime</span>
+    <span>last refresh {{ last_refresh|default("2s ago") }} · <span class="kbd">j</span>/<span class="kbd">k</span> move · <span class="kbd">r</span> reply · <span class="kbd">/</span> search</span>
+  </footer>
+
+  {% block scripts %}{% endblock %}
+
+  <script>
+    // Ack button — single-click message ack from action queue
+    document.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.action-ack');
+      if (!btn) return;
+      e.preventDefault();
+      const msgId = btn.dataset.msgId;
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const res = await fetch(`/api/messages/${msgId}/ack`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          const row = btn.closest('.action-row');
+          if (row) row.style.transition = 'opacity .3s', row.style.opacity = '.2', setTimeout(() => row.remove(), 300);
+          bumpUnread(-1);
+        } else {
+          btn.textContent = '✕';
+        }
+      } catch (err) {
+        btn.textContent = '!';
+        btn.disabled = false;
+      }
+    });
+
+    // Live updates via SSE — bumps unread count without full reload
+    function bumpUnread(delta) {
+      const el = document.querySelector('.page-subtitle strong, [data-unread-count]');
+      if (!el) return;
+      const current = parseInt(el.textContent, 10) || 0;
+      el.textContent = Math.max(0, current + delta);
+      el.classList.add('is-bumped');
+      setTimeout(() => el.classList.remove('is-bumped'), 600);
+    }
+
+    (function connectSSE() {
+      const url = `/api/stream${window.location.search}`;
+      const es = new EventSource(url);
+      es.addEventListener('new_message', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          bumpUnread(1);
+          // Show a tiny toast in footer
+          const foot = document.querySelector('.footer');
+          if (foot && data.subject) {
+            const note = document.createElement('span');
+            note.className = 'sse-flash';
+            note.textContent = `↻ new: ${data.subject}`;
+            foot.appendChild(note);
+            setTimeout(() => note.remove(), 6000);
+          }
+        } catch (err) { /* ignore */ }
+      });
+      es.addEventListener('hello', () => { /* connected */ });
+      es.onerror = () => { /* browser will auto-reconnect */ };
+    })();
+  </script>
+</body>
+</html>

@@ -10,9 +10,13 @@ import hashlib
 import hmac
 import json
 import os
+import uuid
+import queue
 import re
 import sys
 import threading
+import subprocess
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,7 +33,27 @@ TOKEN_PATH = Path(os.environ.get("INTERCOM2_TOKEN_FILE", ROOT / "secrets" / "boo
 HOST = os.environ.get("INTERCOM2_HOST", "0.0.0.0")
 PORT = int(os.environ.get("INTERCOM2_PORT", "8777"))
 DATABASE_URL = os.environ.get("INTERCOM2_DATABASE_URL", "dbname=intercom2 user=intercom2_app")
-APP_VERSION = "0.6.1"
+def _resolve_version() -> str:
+    """Read version from git tag; fallback to constant.
+
+    `git describe --tags --always` returns v0.6.4 or v0.6.4-3-gabc1234
+    on a tagged commit, or just the SHA otherwise. We strip the v
+    prefix and the leading 0. strip prefix when present.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "describe", "--tags", "--always"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            tag = out.stdout.strip().lstrip("v")
+            return tag.split("-", 1)[0] if tag.split("-", 1)[0] else tag
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+    return "0.6.4"
+
+
+APP_VERSION = _resolve_version()
 PRIVILEGED_ACTORS = {"bootstrap", "codex"}
 AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,40}$")
 MAX_BODY_LENGTH = 64 * 1024
@@ -66,6 +90,45 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── SSE event bus (Phase 3 of 4-week plan) ──────────────────
+# In-process pub/sub for streaming events to subscribed operators.
+# A postgres LISTEN/NOTIFY would be the next layer; this is fine for one server.
+
+
+class _EventBus:
+    def __init__(self) -> None:
+        self._subscribers: list[queue.Queue] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=200)
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def publish(self, event_type: str, data: dict) -> None:
+        payload = {"type": event_type, "ts": utc_now(), **data}
+        with self._lock:
+            stale = []
+            for q in self._subscribers:
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    stale.append(q)
+            for q in stale:
+                self._subscribers.remove(q)
+
+
+_event_bus = _EventBus()
+
+
 def connect():
     """Get a connection from the pool.
 
@@ -83,16 +146,37 @@ def connect():
             conn = psycopg2.connect(DATABASE_URL)
             try:
                 yield conn
+                conn.commit()
+            except Exception:
+                try: conn.rollback()
+                except Exception: pass
+                raise
             finally:
                 conn.close()
             return
-        conn = pool.getconn()
+        try:
+            conn = pool.getconn()
+        except psycopg2.pool.PoolError:
+            # Round-2 audit fix: surface pool exhaustion as 503 with
+            # Retry-After instead of 500. Caller should catch the
+            # sentinel exception and translate to HTTP.
+            raise PoolExhausted()
         try:
             yield conn
+            conn.commit()
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            raise
         finally:
             pool.putconn(conn)
 
     return _cm()
+
+
+class PoolExhausted(Exception):
+    """Raised when the Postgres connection pool is exhausted."""
+    pass
 
 
 def get_bootstrap_token() -> str | None:
@@ -104,8 +188,164 @@ def get_bootstrap_token() -> str | None:
     return None
 
 
+# ── Threading + auto-routing (Phase 2 of 4-week plan) ─────────────
+
+
+def resolve_or_create_thread(cur, *, ref_id: int | None, thread_id: str | None,
+                              project: str | None, from_agent: str,
+                              subject: str | None, body: str | None) -> tuple[str, bool]:
+    """Return (thread_id, created_now). Reuses thread on ref_id or thread_id,
+    creates a new one for top-level messages."""
+    if thread_id:
+        cur.execute("SELECT id FROM threads WHERE id = %s", (thread_id,))
+        if cur.fetchone():
+            return thread_id, False
+    if ref_id:
+        cur.execute("SELECT thread_id FROM messages WHERE id = %s", (ref_id,))
+        row = cur.fetchone()
+        if row and row.get("thread_id"):
+            return row["thread_id"], False
+        cur.execute("SELECT project FROM messages WHERE id = %s", (ref_id,))
+        parent = cur.fetchone()
+        if parent and not project:
+            project = parent.get("project")
+    title = subject or (body[:80] if body else f"thread from {from_agent}")
+    cur.execute(
+        """
+        INSERT INTO threads (project, title, created_by, metadata)
+        VALUES (%s, %s, %s, '{}'::jsonb)
+        RETURNING id
+        """,
+        (project, title, from_agent),
+    )
+    return cur.fetchone()["id"], True
+
+
+def resolve_default_owner(cur, project: str | None) -> str | None:
+    """Look up the project's default owner agent. Returns None if not set or no project."""
+    if not project:
+        return None
+    cur.execute(
+        "SELECT default_owner_agent FROM projects WHERE name = %s",
+        (project,),
+    )
+    row = cur.fetchone()
+    if row and row.get("default_owner_agent"):
+        return row["default_owner_agent"]
+    return None
+
+
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ── Reply shortcut: /reply #<msg_id> ──────────────────────────
+
+_REPLY_RE = re.compile(r"^/reply\s+#(\d+)\s*(.*)$", re.DOTALL)
+
+
+def parse_reply_shortcut(body: str | None) -> tuple[int | None, str | None]:
+    """If body starts with /reply #<id>, return (msg_id, rest_of_body). Otherwise (None, body)."""
+    if not body:
+        return None, body
+    m = _REPLY_RE.match(body.strip())
+    if not m:
+        return None, body
+    return int(m.group(1)), m.group(2).strip()
+
+
+# ── Lumino scenario: stale-inbox detection (Phase 4 regression) ──
+# This is the function locked by the 4-day Lumino handoff gap regression test.
+# If a message is unread > 1h AND the recipient agent hasn't been seen in > 1h,
+# the operator must be alerted. Used by the watchdog and operator queue.
+
+LUMINO_STALE_MESSAGE_HOURS = 1
+LUMINO_STALE_AGENT_MINUTES = 60
+
+
+# ── Body redaction (Phase 5: secrets in messages are forbidden) ──
+# ARCHITECTURE.md says "No secrets in message bodies." We enforce it by
+# rejecting any body that matches a known credential pattern. False
+# positives are acceptable — operators can rephrase.
+
+import re as _re
+
+_SECRET_PATTERNS: tuple[_re.Pattern[str], ...] = (
+    _re.compile(r"AKIA[0-9A-Z]{16}"),                          # AWS access key
+    _re.compile(r"aws_secret_access_key\s*=\s*[\w/+=]{40}"),  # AWS secret
+    _re.compile(r"ghp_[A-Za-z0-9]{36,}"),                      # GitHub PAT
+    _re.compile(r"gho_[A-Za-z0-9]{36,}"),                      # GitHub OAuth
+    _re.compile(r"github_pat_[A-Za-z0-9_]{82}"),               # GitHub fine-grained PAT
+    _re.compile(r"sk-[A-Za-z0-9]{20,}"),                       # OpenAI / Anthropic key
+    _re.compile(r"sk_live_[A-Za-z0-9]{24,}"),                  # Stripe live
+    _re.compile(r"sk_test_[A-Za-z0-9]{24,}"),                  # Stripe test
+    _re.compile(r"xox[abp]-[A-Za-z0-9-]{10,}"),                # Slack tokens
+    _re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+    _re.compile(r"(?i)password\s*[:=]\s*['\"][^'\"]{8,}['\"]"),
+    _re.compile(r"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]\s*['\"]?[A-Za-z0-9_/+=-]{16,}"),
+)
+
+
+def contains_secret(body: str | None) -> bool:
+    """True if the body looks like it contains a credential pattern."""
+    if not body:
+        return False
+    for pat in _SECRET_PATTERNS:
+        if pat.search(body):
+            return True
+    return False
+
+
+def _resolve_lumino_stale_alert(msg: dict, agent: dict, now=None) -> dict:
+    """Return {is_stale, should_warn, reason} for a message/agent pair.
+
+    - is_stale:    message is older than the staleness threshold
+    - should_warn: is_stale AND agent hasn't been seen in > N minutes
+    - reason:      human-readable explanation
+    """
+    from datetime import datetime, timedelta, timezone
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    msg_created = msg.get("created_at")
+    if isinstance(msg_created, str):
+        try:
+            msg_created = datetime.fromisoformat(msg_created.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return {"is_stale": False, "should_warn": False, "reason": "unparseable_msg_time"}
+    if msg_created and msg_created.tzinfo is None:
+        msg_created = msg_created.replace(tzinfo=timezone.utc)
+
+    agent_seen = agent.get("last_seen_at")
+    if isinstance(agent_seen, str):
+        try:
+            agent_seen = datetime.fromisoformat(agent_seen.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            agent_seen = None
+    if agent_seen and agent_seen.tzinfo is None:
+        agent_seen = agent_seen.replace(tzinfo=timezone.utc)
+
+    msg_age = (now - msg_created).total_seconds() / 3600 if msg_created else 0
+    agent_age_min = (now - agent_seen).total_seconds() / 60 if agent_seen else 99999
+
+    is_stale = msg_age > LUMINO_STALE_MESSAGE_HOURS
+    agent_offline = agent_age_min > LUMINO_STALE_AGENT_MINUTES
+    should_warn = is_stale and agent_offline
+
+    reason = ""
+    if should_warn:
+        reason = (
+            f"agent {agent.get('name', '?')} silent for {int(agent_age_min)}m, "
+            f"message #{msg.get('id', '?')} unread for {int(msg_age)}h"
+        )
+
+    return {
+        "is_stale": is_stale,
+        "should_warn": should_warn,
+        "reason": reason,
+        "msg_age_hours": msg_age,
+        "agent_offline_minutes": agent_age_min,
+    }
 
 
 def valid_agent_name(name: str) -> bool:
@@ -148,6 +388,20 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) ->
     handler.send_header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Intercom-Token")
+    if hasattr(handler, "_maybe_flush_session_cookie"):
+        handler._maybe_flush_session_cookie()
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def send_html(handler: BaseHTTPRequestHandler, body: bytes) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
+    handler.send_header("Cache-Control", "no-store")
+    if hasattr(handler, "_maybe_flush_session_cookie"):
+        handler._maybe_flush_session_cookie()
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -162,6 +416,9 @@ class Intercom2Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         json_response(self, 200, {"ok": True})
+
+    def _send_html(self, body: bytes) -> None:
+        send_html(self, body)
 
     def do_HEAD(self) -> None:
         if urlparse(self.path).path.rstrip("/") in {"", "/", "/health", "/api/health", "/dashboard", "/ui"}:
@@ -182,13 +439,97 @@ class Intercom2Handler(BaseHTTPRequestHandler):
         query_token = parse_qs(urlparse(self.path).query).get("token", [None])[0]
         return query_token.strip() if query_token else None
 
+    def auth_cookie(self) -> str | None:
+        """Read the session cookie (opaque UUID, not the agent token)."""
+        c = self.headers.get("Cookie", "")
+        for part in c.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "ic2_session" and v:
+                return v
+        return None
+
     def authorized_agent(self) -> str | None:
+        # Try cookie first (browsers send automatically on nav)
+        session_id = self.auth_cookie()
+        if session_id:
+            agent = self._agent_from_session(session_id)
+            if agent:
+                return agent
+        # Fall back to header/query (curl, scripts, shareable URLs)
         presented = self.auth_token()
+        if not presented:
+            return None
+        agent = self._agent_from_token(presented)
+        # Defer the Set-Cookie header until response time. Store the
+        # session ID we'll create for this token (a fresh UUID), not
+        # the token itself.
+        if agent and not session_id:
+            self._pending_new_session = presented
+        return agent
+
+    def _agent_from_session(self, session_id: str) -> str | None:
+        """Look up an agent by session ID, refreshing last_seen_at."""
+        # Validate UUID format to avoid SQL errors
+        try:
+            uuid.UUID(session_id)
+        except (ValueError, AttributeError):
+            return None
+        bootstrap = get_bootstrap_token()
+        if bootstrap and session_id == bootstrap:
+            return "bootstrap"  # never reached; bootstrap is its own path
+        with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT agents.name, sessions.token_hash
+                FROM sessions
+                JOIN agents ON agents.name = sessions.agent
+                WHERE sessions.id = %s
+                  AND sessions.expires_at > now()
+                  AND agents.status = 'active'
+                """,
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute("UPDATE sessions SET last_seen_at = now() WHERE id = %s", (session_id,))
+            # The token in the session is hashed; we can verify it's still
+            # valid by checking the agent_tokens table for a matching hash
+            # and active status. But for simplicity, if the session exists
+            # and is unexpired, the user is considered authenticated.
+            return row["name"]
+
+    def _maybe_flush_session_cookie(self) -> None:
+        """Called by response helpers to add the Set-Cookie header if pending.
+
+        Creates a server-side session row, stores the token_hash, and
+        emits a short opaque session ID as the cookie. The agent token
+        is never sent to the browser.
+        """
+        if hasattr(self, "_pending_new_session") and self._pending_new_session:
+            presented = self._pending_new_session
+            agent = self._agent_from_token(presented)
+            if agent:
+                with connect() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO sessions (agent, token_hash, expires_at)
+                        VALUES (%s, %s, now() + INTERVAL '24 hours')
+                        RETURNING id
+                        """,
+                        (agent, token_hash(presented)),
+                    )
+                    session_id = cur.fetchone()[0]
+                self.send_header(
+                    "Set-Cookie",
+                    f"ic2_session={session_id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400",
+                )
+            self._pending_new_session = None
+
+    def _agent_from_token(self, presented: str) -> str | None:
         bootstrap = get_bootstrap_token()
         if bootstrap and presented and hmac.compare_digest(presented, bootstrap):
             return "bootstrap"
-        if not presented:
-            return None
         digest = token_hash(presented)
         with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -288,11 +629,59 @@ class Intercom2Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:
+        try:
+            self._do_GET_inner()
+        except PoolExhausted:
+            try:
+                self.send_response(503)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "29")
+                self.end_headers()
+                self.wfile.write(b"Service overloaded, retry\n")
+            except Exception:
+                pass
+
+    def _do_GET_inner(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         qs = parse_qs(parsed.query)
 
-        if path in {"/", "/health", "/api/health"}:
+        if path.startswith("/static/"):
+            # Static assets — no auth required (browsers need to load CSS without tokens)
+            rel = path.removeprefix("/static/").lstrip("/")
+            full = (Path("/srv/agent-share/intercom2/static") / rel).resolve()
+            try:
+                full.relative_to(Path("/srv/agent-share/intercom2/static").resolve())
+            except ValueError:
+                json_response(self, 400, {"ok": False, "error": "bad_path"})
+                return
+            if not full.is_file():
+                json_response(self, 404, {"ok": False, "error": "not_found"})
+                return
+            ext = full.suffix.lower()
+            ctype = {
+                ".css": "text/css; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+                ".png": "image/png",
+                ".svg": "image/svg+xml",
+                ".ico": "image/x-icon",
+                ".woff2": "font/woff2",
+            }.get(ext, "application/octet-stream")
+            try:
+                with open(full, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.end_headers()
+                self.wfile.write(data)
+            except FileNotFoundError:
+                json_response(self, 404, {"ok": False, "error": "not_found"})
+            return
+
+        if path == "/api/health":
             try:
                 with connect() as conn, conn.cursor() as cur:
                     cur.execute("SELECT 1")
@@ -368,14 +757,14 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             json_response(self, 200, rows)
             return
 
-        if path in {"/api/agents", "/agents"}:
+        if path == "/api/agents":
             with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SELECT name, display_name, role, endpoint, status, last_seen_at, created_at, updated_at FROM agents ORDER BY name")
                 rows = cur.fetchall()
             json_response(self, 200, rows)
             return
 
-        if path in {"/api/handoffs", "/handoffs"}:
+        if path == "/api/handoffs":
             limit = min(int(qs.get("limit", ["50"])[0]), 500)
             status = qs.get("status", [None])[0]
             project = qs.get("project", [None])[0]
@@ -449,13 +838,281 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             json_response(self, 200, {"metrics": metrics, "agents": agents, "messages": messages, "handoffs": handoffs})
             return
 
+        if path == "/api/stream":
+            # Server-Sent Events endpoint. Streams new_message, handoff_status,
+            # agent_online events. Closes when client disconnects.
+            sub_q = _event_bus.subscribe()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                # initial hello
+                hello = json.dumps({"type": "hello", "ts": utc_now(), "operator": actor})
+                self.wfile.write(f"event: hello\ndata: {hello}\n\n".encode())
+                self.wfile.flush()
+                last_ping = time.time()
+                while True:
+                    try:
+                        event = sub_q.get(timeout=15)
+                        evt_type = event.get("type", "message")
+                        data = json.dumps(event)
+                        self.wfile.write(f"event: {evt_type}\ndata: {data}\n\n".encode())
+                        self.wfile.flush()
+                    except queue.Empty:
+                        # Keepalive ping every 15s
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            finally:
+                _event_bus.unsubscribe(sub_q)
+            return
+
+        if path == "/api/operator/queue":
+            with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # 1. Unread messages addressed to me
+                cur.execute(
+                    """
+                    SELECT m.id, m.thread_id, m.from_agent, m.to_agent, m.project, m.message_type,
+                           m.priority, m.subject, m.body, m.created_at, m.metadata,
+                           EXISTS(SELECT 1 FROM messages m2 WHERE m2.thread_id = m.thread_id AND m2.id != m.id) AS has_replies,
+                           (m.created_at < now() - INTERVAL '1 hour') AS stale
+                    FROM messages m
+                    WHERE m.to_agent = %s AND m.status = 'unread'
+                    ORDER BY
+                        CASE m.priority
+                            WHEN 'urgent' THEN 1
+                            WHEN 'high' THEN 2
+                            WHEN 'normal' THEN 3
+                            WHEN 'low' THEN 4
+                            ELSE 5
+                        END,
+                        m.created_at DESC
+                    LIMIT 50
+                    """,
+                    (actor,),
+                )
+                unread = [dict(r) for r in cur.fetchall()]
+
+                # 2. Handoffs I own (received, not completed)
+                cur.execute(
+                    """
+                    SELECT id, from_agent, to_agent, project, title, description, status, priority,
+                           created_at, updated_at
+                    FROM handoffs
+                    WHERE to_agent = %s AND status NOT IN ('completed', 'cancelled', 'rejected')
+                    ORDER BY
+                        CASE priority
+                            WHEN 'urgent' THEN 1
+                            WHEN 'high' THEN 2
+                            WHEN 'normal' THEN 3
+                            WHEN 'low' THEN 4
+                            ELSE 5
+                        END,
+                        created_at DESC
+                    LIMIT 30
+                    """,
+                    (actor,),
+                )
+                handoffs_owned = [dict(r) for r in cur.fetchall()]
+
+                # 3. Threads waiting on my reply (I'm the original sender, last msg is from someone else)
+                cur.execute(
+                    """
+                    SELECT t.id AS thread_id, t.project, t.title, t.created_at, t.updated_at,
+                           (SELECT from_agent FROM messages WHERE thread_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1) AS last_sender,
+                           (SELECT created_at FROM messages WHERE thread_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1) AS last_msg_at
+                    FROM threads t
+                    WHERE t.created_by = %s
+                      AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.to_agent = %s)
+                      AND (SELECT from_agent FROM messages WHERE thread_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1) != %s
+                    ORDER BY t.updated_at DESC
+                    LIMIT 20
+                    """,
+                    (actor, actor, actor),
+                )
+                waiting = [dict(r) for r in cur.fetchall()]
+
+                # 4. Unread messages in projects I own (auto-routed to me)
+                cur.execute(
+                    """
+                    SELECT m.id, m.thread_id, m.from_agent, m.to_agent, m.project, m.message_type,
+                           m.priority, m.subject, m.body, m.created_at,
+                           (m.metadata->>'auto_routed')::bool AS auto_routed
+                    FROM messages m
+                    JOIN projects p ON m.project_id = p.id
+                    WHERE p.default_owner_agent = %s
+                      AND m.status = 'unread'
+                      AND m.to_agent != %s
+                    ORDER BY m.created_at DESC
+                    LIMIT 30
+                    """,
+                    (actor, actor),
+                )
+                routed = [dict(r) for r in cur.fetchall()]
+
+            json_response(self, 200, {
+                "ok": True,
+                "operator": actor,
+                "unread": unread,
+                "handoffs_owned": handoffs_owned,
+                "threads_waiting": waiting,
+                "auto_routed": routed,
+                "counts": {
+                    "unread": len(unread),
+                    "handoffs": len(handoffs_owned),
+                    "waiting": len(waiting),
+                    "routed": len(routed),
+                },
+            })
+            return
+
+        if path.startswith("/api/threads/"):
+            thread_id = path.removeprefix("/api/threads/").strip("/")
+            if not thread_id:
+                json_response(self, 400, {"ok": False, "error": "thread_id required"})
+                return
+            with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, project, title, status, priority, created_by, created_at, updated_at FROM threads WHERE id = %s",
+                    (thread_id,),
+                )
+                thread = cur.fetchone()
+                if not thread:
+                    json_response(self, 404, {"ok": False, "error": "thread_not_found"})
+                    return
+                cur.execute(
+                    """
+                    SELECT id, thread_id, from_agent, to_agent, project, message_type, priority,
+                           subject, body, expected_action, blocking_reason, metadata,
+                           ref_id, status, created_at, read_at
+                    FROM messages
+                    WHERE thread_id = %s
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (thread_id,),
+                )
+                messages = cur.fetchall()
+                participants = sorted({m["from_agent"] for m in messages} | {m["to_agent"] for m in messages})
+            json_response(self, 200, {
+                "ok": True,
+                "thread": dict(thread),
+                "messages": [dict(m) for m in messages],
+                "participants": participants,
+                "reply_count": len(messages) - 1,
+            })
+            return
+
+        if path == "/":
+            try:
+                from portal import render_today
+                with connect() as conn:
+                    html = render_today(conn, actor)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path == "/projects" or path == "/projects/":
+            try:
+                from portal import render_projects
+                with connect() as conn:
+                    html = render_projects(conn, actor)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path == "/projects/new" or path == "/projects/new/":
+            try:
+                from portal import render_new_project_form
+                html = render_new_project_form(actor=actor, query_string=parsed.query)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path.startswith("/projects/"):
+            # /projects/<name> — single project view
+            project_name = path.removeprefix("/projects/").strip("/")
+            try:
+                from portal import render_project_detail
+                with connect() as conn:
+                    html = render_project_detail(conn, project_name, actor)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path == "/inbox":
+            try:
+                from portal import render_inbox
+                with connect() as conn:
+                    html = render_inbox(conn, actor)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path == "/handoffs":
+            try:
+                from portal import render_handoffs
+                with connect() as conn:
+                    html = render_handoffs(conn, actor)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path == "/health":
+            try:
+                from portal import render_health
+                with connect() as conn:
+                    html = render_health(conn, actor)
+                self._send_html(html.encode() if isinstance(html, str) else html)
+            except Exception as exc:
+                self.send_error(500, str(exc))
+            return
+
+        if path.startswith("/threads/"):
+            thread_id = path.removeprefix("/threads/").strip("/")
+            if thread_id:
+                try:
+                    from portal import render_thread
+                    with connect() as conn:
+                        html = render_thread(conn, thread_id, actor)
+                    self._send_html(html.encode() if isinstance(html, str) else html)
+                except Exception as exc:
+                    self.send_error(500, str(exc))
+                return
+
         if path in {"/dashboard", "/ui"}:
-            self.render_dashboard(actor)
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
 
         json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
+        try:
+            self._do_POST_inner()
+        except PoolExhausted:
+            try:
+                self.send_response(503)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "29")
+                self.end_headers()
+                self.wfile.write(b"Service overloaded, retry\n")
+            except Exception:
+                pass
+
+    def _do_POST_inner(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         actor = self.require_auth()
@@ -471,16 +1128,28 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             json_response(self, 413, {"ok": False, "error": "payload_too_large_or_unparseable"})
             return
 
+        if path.startswith("/api/threads/") and (path.endswith("/subscribe") or path.endswith("/unsubscribe")):
+            parts = path.removeprefix("/api/threads/").strip("/").split("/")
+            thread_id = parts[0]
+            action = parts[1] if len(parts) > 1 else None
+            if action not in ("subscribe", "unsubscribe"):
+                json_response(self, 400, {"ok": False, "error": "expected_subscribe_or_unsubscribe"})
+                return
+            with connect() as conn, conn.cursor() as cur:
+                if action == "subscribe":
+                    cur.execute(
+                        "INSERT INTO thread_subscriptions (thread_id, agent) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                        (thread_id, actor),
+                    )
+                else:
+                    cur.execute("DELETE FROM thread_subscriptions WHERE thread_id = %s AND agent = %s", (thread_id, actor))
+            _event_bus.publish("subscription_changed", {"thread_id": thread_id, "agent": actor, "action": action})
+            json_response(self, 200, {"ok": True, "thread_id": thread_id, "agent": actor, "action": action})
+            return
+
         if path in {"/api/messages", "/api/send", "/messages", "/send"}:
             from_agent = str(payload.get("from_agent") or payload.get("from") or actor).strip()
             to_agent = str(payload.get("to_agent") or payload.get("to") or "").strip()
-            if not from_agent or not to_agent:
-                json_response(self, 400, {"ok": False, "error": "from_agent and to_agent required"})
-                return
-            if not self.ensure_can_speak_as(actor, from_agent):
-                return
-            if not self.ensure_valid_to_agent(to_agent):
-                return
             metadata = payload.get("metadata") or payload.get("data") or {}
             if isinstance(metadata, str):
                 try:
@@ -499,21 +1168,75 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             if not ok:
                 json_response(self, 413, {"ok": False, "error": "body_too_large", "max": MAX_BODY_LENGTH})
                 return
+            if contains_secret(body) or contains_secret(subject):
+                json_response(self, 400, {"ok": False, "error": "secret_pattern_detected", "detail": "ARCHITECTURE.md: no secrets in messages. Rephrase."})
+                return
             project, ok = _cap_text(payload.get("project"), MAX_PROJECT_LENGTH, "project")
             if not ok:
                 json_response(self, 413, {"ok": False, "error": "project_too_large", "max": MAX_PROJECT_LENGTH})
                 return
+            # Phase 4: /reply #<id> shortcut — resolve to ref_id, set to_agent from parent
+            reply_msg_id, reply_body = parse_reply_shortcut(body)
+            if reply_msg_id is not None and not payload.get("ref_id"):
+                with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("SELECT from_agent, project FROM messages WHERE id = %s", (reply_msg_id,))
+                    parent = cur.fetchone()
+                if not parent:
+                    json_response(self, 404, {"ok": False, "error": "reply_target_not_found", "msg_id": reply_msg_id})
+                    return
+                payload["ref_id"] = reply_msg_id
+                if not to_agent:
+                    to_agent = parent["from_agent"]
+                if not project and parent.get("project"):
+                    project = parent["project"]
+                body = reply_body or body
+            # Validation BEFORE opening a DB connection — prevents pool exhaustion on bad input.
+            if not from_agent:
+                json_response(self, 400, {"ok": False, "error": "from_agent required"})
+                return
+            if not self.ensure_can_speak_as(actor, from_agent):
+                return
+            # If to_agent is still missing, we need the project owner lookup. That requires DB.
+            # We do the cheap validation first, then the DB lookup, then the final recipient check.
             with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Phase 2: auto-routing when to_agent is missing.
+                auto_routed = False
+                if not to_agent:
+                    owner = resolve_default_owner(cur, project)
+                    if owner:
+                        to_agent = owner
+                        auto_routed = True
+                if not to_agent:
+                    json_response(self, 400, {"ok": False, "error": "to_agent required (and no project default_owner for auto-routing)"})
+                    return
+                if not self.ensure_valid_to_agent(to_agent):
+                    return
+                # Phase 2: auto-thread on POST.
+                ref_id_val = payload.get("ref_id")
+                thread_id_val = payload.get("thread_id")
+                thread_id, _thread_created = resolve_or_create_thread(
+                    cur,
+                    ref_id=int(ref_id_val) if ref_id_val is not None else None,
+                    thread_id=thread_id_val,
+                    project=project,
+                    from_agent=from_agent,
+                    subject=subject,
+                    body=body,
+                )
+                if auto_routed:
+                    metadata["auto_routed"] = True
+                    metadata_json = json.dumps(metadata)
                 cur.execute(
                     """
                     INSERT INTO messages (
-                        from_agent, to_agent, project, message_type, priority, subject, body,
+                        thread_id, from_agent, to_agent, project, message_type, priority, subject, body,
                         expected_action, blocking_reason, metadata, ref_id
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                     RETURNING id, created_at
                     """,
                     (
+                        thread_id,
                         from_agent,
                         to_agent,
                         project,
@@ -542,41 +1265,171 @@ class Intercom2Handler(BaseHTTPRequestHandler):
                     INSERT INTO audit_events (event_type, actor, subject, details)
                     VALUES ('message_sent', %s, %s, %s::jsonb)
                     """,
-                    (from_agent, to_agent, json.dumps({"message_id": row["id"]})),
+                    (from_agent, to_agent, json.dumps({"message_id": row["id"], "thread_id": thread_id, "auto_routed": auto_routed})),
                 )
-            json_response(self, 201, {"ok": True, "id": row["id"], "created_at": row["created_at"]})
+            # Phase 4: notify thread subscribers (excluding from/to + auto-routing)
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT agent FROM thread_subscriptions WHERE thread_id = %s AND agent NOT IN (%s, %s)", (thread_id, from_agent, to_agent))
+                subscribers = [r[0] for r in cur.fetchall()]
+            _event_bus.publish("new_message", {
+                "id": row["id"],
+                "from": from_agent,
+                "to": to_agent,
+                "thread_id": thread_id,
+                "project": project,
+                "subject": subject,
+                "auto_routed": auto_routed,
+            })
+            for sub in subscribers:
+                _event_bus.publish("thread_reply", {
+                    "thread_id": thread_id,
+                    "subscriber": sub,
+                    "from": from_agent,
+                    "subject": subject,
+                })
+            json_response(self, 201, {"ok": True, "id": row["id"], "created_at": row["created_at"], "thread_id": thread_id, "to_agent": to_agent, "from_agent": from_agent, "auto_routed": auto_routed, "subscribers_notified": subscribers})
+            return
+
+        if path == "/api/admin/archive-threads":
+            # Phase 4: archive threads idle > 30 days. Operator-only.
+            if not self.is_privileged(actor):
+                json_response(self, 403, {"ok": False, "error": "forbidden"})
+                return
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE threads
+                    SET status = 'archived', updated_at = now()
+                    WHERE status != 'archived'
+                      AND updated_at < now() - INTERVAL '30 days'
+                    RETURNING id, project, title
+                    """,
+                )
+                archived = cur.fetchall()
+                # Also archive the messages on those threads (set status='archived' on the messages too)
+                if archived:
+                    ids = [r[0] for r in archived]
+                    cur.execute(
+                        "UPDATE messages SET status = 'archived' WHERE thread_id = ANY(%s) AND status = 'read'",
+                        (ids,),
+                    )
+            _event_bus.publish("threads_archived", {"count": len(archived)})
+            json_response(self, 200, {"ok": True, "archived_count": len(archived), "archived": [dict(r) for r in archived[:20]]})
+            return
+
+        if path in {"/projects/new", "/projects/new/"}:
+            # Create a project + role assignment
+            name = str(payload.get("name") or "").strip().lower()
+            description = str(payload.get("description") or "").strip()
+            default_owner = str(payload.get("default_owner") or "").strip().lower()
+            coding = str(payload.get("coding") or "").strip().lower()
+            reviewing = str(payload.get("reviewing") or "").strip().lower()
+            if not name or not re.match(r"^[a-z][a-z0-9_-]{1,40}$", name):
+                # For HTML form submissions, redirect to form with error.
+                # For JSON API calls, return 400 JSON.
+                accept = self.headers.get("Accept", "")
+                if "text/html" in accept:
+                    self.send_response(303)
+                    self.send_header("Location", f"/projects/new?error=invalid_name&name={name}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                json_response(self, 400, {"ok": False, "error": "invalid_project_name", "name": name})
+                return
+            try:
+                with connect() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO projects (name, description, default_owner_agent, coding_agent, reviewing_agent)
+                           VALUES (%s, %s, %s, %s, %s)
+                           ON CONFLICT (name) DO UPDATE SET
+                               description = EXCLUDED.description,
+                               default_owner_agent = EXCLUDED.default_owner_agent,
+                               coding_agent = EXCLUDED.coding_agent,
+                               reviewing_agent = EXCLUDED.reviewing_agent""",
+                        (name, description or None, default_owner or None, coding or None, reviewing or None),
+                    )
+                    cur.execute(
+                        "INSERT INTO audit_events (event_type, actor, subject, details) VALUES ('project_created', %s, %s, %s::jsonb)",
+                        (actor, name, json.dumps({
+                            "description": description,
+                            "default_owner": default_owner,
+                            "coding": coding,
+                            "reviewing": reviewing,
+                        })),
+                    )
+            except Exception as exc:
+                json_response(self, 500, {"ok": False, "error": f"db_error: {exc}"})
+                return
+            _event_bus.publish("project_created", {"name": name, "default_owner": default_owner})
+            # Invalidate the discover_projects cache so the new project
+            # shows up immediately on the next page render.
+            try:
+                from portal import invalidate_project_cache
+                invalidate_project_cache()
+            except Exception:
+                pass
+            self.send_response(303)
+            self.send_header("Location", "/projects")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
 
         if path in {"/ui/send"}:
             from_agent = str(payload.get("from_agent") or payload.get("from") or actor).strip()
             to_agent = str(payload.get("to_agent") or payload.get("to") or "").strip()
-            if not from_agent or not to_agent:
-                json_response(self, 400, {"ok": False, "error": "from_agent and to_agent required"})
-                return
-            if not self.ensure_can_speak_as(actor, from_agent):
-                return
-            if not self.ensure_valid_to_agent(to_agent):
+            project_val = payload.get("project") or None
+            ui_body = payload.get("body") or ""
+            if contains_secret(ui_body) or contains_secret(payload.get("subject")):
+                json_response(self, 400, {"ok": False, "error": "secret_pattern_detected"})
                 return
             with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Phase 2: auto-routing on UI send too.
+                auto_routed = False
+                if not to_agent:
+                    owner = resolve_default_owner(cur, project_val)
+                    if owner:
+                        to_agent = owner
+                        auto_routed = True
+                if not from_agent or not to_agent:
+                    json_response(self, 400, {"ok": False, "error": "from_agent and to_agent required (and no project default_owner for auto-routing)"})
+                    return
+                if not self.ensure_can_speak_as(actor, from_agent):
+                    return
+                if not self.ensure_valid_to_agent(to_agent):
+                    return
+                # Phase 2: auto-thread on POST.
+                ref_id_val = payload.get("ref_id")
+                thread_id_val = payload.get("thread_id")
+                thread_id, _thread_created = resolve_or_create_thread(
+                    cur,
+                    ref_id=int(ref_id_val) if ref_id_val is not None else None,
+                    thread_id=thread_id_val,
+                    project=project_val,
+                    from_agent=from_agent,
+                    subject=payload.get("subject"),
+                    body=payload.get("body"),
+                )
                 cur.execute(
                     """
                     INSERT INTO messages (
-                        from_agent, to_agent, project, message_type, priority, subject, body,
+                        thread_id, from_agent, to_agent, project, message_type, priority, subject, body,
                         expected_action, blocking_reason, metadata, ref_id
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                     RETURNING id
                     """,
                     (
+                        thread_id,
                         from_agent,
                         to_agent,
-                        payload.get("project") or None,
+                        project_val,
                         payload.get("message_type") or "msg",
                         payload.get("priority") or "normal",
                         payload.get("subject") or None,
                         payload.get("body") or "",
                         payload.get("expected_action") or None,
                         payload.get("blocking_reason") or None,
+                        json.dumps({"auto_routed": auto_routed}) if auto_routed else '{}',
                         payload.get("ref_id") or None,
                     ),
                 )
@@ -595,7 +1448,16 @@ class Intercom2Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/messages/") and path.endswith("/ack"):
             msg_id = int(path.split("/")[-2])
-            with connect() as conn, conn.cursor() as cur:
+            with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT to_agent FROM messages WHERE id = %s", (msg_id,))
+                row = cur.fetchone()
+                if not row:
+                    json_response(self, 404, {"ok": False, "error": "message_not_found"})
+                    return
+                # Phase 5: only the recipient (or a privileged actor) can ack.
+                if not self.is_privileged(actor) and actor != row["to_agent"]:
+                    json_response(self, 403, {"ok": False, "error": "forbidden_ack", "actor": actor, "to_agent": row["to_agent"]})
+                    return
                 cur.execute("UPDATE messages SET status = 'read', read_at = now() WHERE id = %s", (msg_id,))
                 cur.execute(
                     """
@@ -605,12 +1467,27 @@ class Intercom2Handler(BaseHTTPRequestHandler):
                     """,
                     (msg_id, actor),
                 )
+                cur.execute(
+                    """
+                    INSERT INTO audit_events (event_type, actor, subject, details)
+                    VALUES ('message_acked', %s, %s, %s::jsonb)
+                    """,
+                    (actor, row["to_agent"], json.dumps({"message_id": msg_id})),
+                )
             json_response(self, 200, {"ok": True, "id": msg_id})
             return
 
         if path.startswith("/ui/messages/") and path.endswith("/ack"):
             msg_id = int(path.split("/")[-2])
-            with connect() as conn, conn.cursor() as cur:
+            with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT to_agent FROM messages WHERE id = %s", (msg_id,))
+                row = cur.fetchone()
+                if not row:
+                    json_response(self, 404, {"ok": False, "error": "message_not_found"})
+                    return
+                if not self.is_privileged(actor) and actor != row["to_agent"]:
+                    json_response(self, 403, {"ok": False, "error": "forbidden_ack", "actor": actor, "to_agent": row["to_agent"]})
+                    return
                 cur.execute("UPDATE messages SET status = 'read', read_at = now() WHERE id = %s", (msg_id,))
                 cur.execute(
                     """
@@ -623,7 +1500,7 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             self.redirect_dashboard()
             return
 
-        if path in {"/api/agents", "/agents"}:
+        if path == "/api/agents":
             name = str(payload.get("name") or "").strip()
             if not name:
                 json_response(self, 400, {"ok": False, "error": "name required"})
@@ -655,7 +1532,7 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             json_response(self, 200, {"ok": True, "name": name})
             return
 
-        if path in {"/api/handoffs", "/handoffs"}:
+        if path == "/api/handoffs":
             from_agent = str(payload.get("from_agent") or payload.get("from") or actor).strip()
             to_agent = str(payload.get("to_agent") or payload.get("to") or "").strip()
             title = str(payload.get("title") or "").strip()
@@ -871,301 +1748,6 @@ class Intercom2Handler(BaseHTTPRequestHandler):
             return
 
         json_response(self, 404, {"ok": False, "error": "not_found"})
-
-    def render_dashboard(self, actor: str) -> None:
-        qs = parse_qs(urlparse(self.path).query)
-        project_filter = (qs.get("project", [""])[0] or "").strip()
-        token_suffix = self.query_token_suffix()
-        token_hidden = f"<input type='hidden' name='token' value='{self.auth_token() or ''}'>"
-        project_where = "WHERE project = %s" if project_filter else ""
-        project_params: list[Any] = [project_filter] if project_filter else []
-        with connect() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                  (SELECT count(*) FROM messages) AS messages,
-                  (SELECT count(*) FROM messages WHERE status = 'unread') AS unread,
-                  (SELECT count(*) FROM handoffs WHERE status IN ('proposed', 'accepted', 'blocked')) AS open_handoffs,
-                  (SELECT count(*) FROM handoffs WHERE status = 'blocked') AS blocked_handoffs,
-                  (SELECT count(*) FROM agents WHERE status = 'active') AS active_agents
-                """
-            )
-            metrics = cur.fetchone()
-            cur.execute("SELECT name, role, status, last_seen_at FROM agents ORDER BY name")
-            agents = cur.fetchall()
-            cur.execute(
-                f"""
-                SELECT id, project, from_agent, to_agent, message_type, priority, status, body, created_at
-                FROM messages
-                {project_where}
-                ORDER BY id DESC
-                LIMIT 20
-                """,
-                project_params,
-            )
-            messages = cur.fetchall()
-            cur.execute(
-                f"""
-                SELECT id, project, from_agent, to_agent, title, status, priority, description, updated_at
-                FROM handoffs
-                {project_where}
-                ORDER BY created_at DESC
-                LIMIT 20
-                """,
-                project_params,
-            )
-            handoffs = cur.fetchall()
-
-        def esc(value: Any) -> str:
-            text = "" if value is None else str(value)
-            return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        def badge(value: Any, prefix: str = "") -> str:
-            safe = esc(value or "none")
-            cls = (str(value or "none").lower().replace("_", "-").replace(" ", "-"))
-            return f"<span class='badge {prefix}{cls}'>{safe}</span>"
-
-        cards = "".join(
-            f"""
-            <article class='metric-card {esc(key)}'>
-              <div class='metric-label'>{esc(label)}</div>
-              <div class='metric-value'>{esc(metrics[key])}</div>
-              <div class='metric-rule'></div>
-            </article>
-            """
-            for label, key in [
-                ("Messages", "messages"),
-                ("Unread", "unread"),
-                ("Open Handoffs", "open_handoffs"),
-                ("Blocked", "blocked_handoffs"),
-                ("Agents", "active_agents"),
-            ]
-        )
-        agent_cards = "".join(
-            f"""
-            <article class='agent-card'>
-              <div class='agent-avatar'>{esc((a['name'] or '?')[:2]).upper()}</div>
-              <div>
-                <h3>{esc(a['name'])}</h3>
-                <p>{esc(a['role'] or 'Unassigned')}</p>
-                <small>Last seen: {esc(a['last_seen_at'] or 'not yet')}</small>
-              </div>
-              {badge(a['status'], 'agent-')}
-            </article>
-            """
-            for a in agents
-        )
-        msg_rows = "".join(
-            f"""
-            <article class='feed-item'>
-              <div class='feed-top'><strong>#{esc(m['id'])} · {esc(m['project'] or 'general')}</strong>{badge(m['message_type'], 'type-')}</div>
-              <div class='route'>{esc(m['from_agent'])} <span>to</span> {esc(m['to_agent'])}</div>
-              <p>{esc((m['body'] or '')[:220])}</p>
-              <footer>
-                <span>{badge(m['status'], 'message-')} <span>{esc(m['created_at'])}</span></span>
-                <form method='post' action='/ui/messages/{esc(m['id'])}/ack{token_suffix}'><button class='ghost'>Ack</button></form>
-              </footer>
-            </article>
-            """
-            for m in messages
-        )
-        handoff_rows = "".join(
-            f"""
-            <article class='handoff-item'>
-              <div class='handoff-status'>{badge(h['status'], 'handoff-')}</div>
-              <div>
-                <h3>{esc(h['title'])}</h3>
-                <p>{esc(h['project'] or 'general')} · {esc(h['from_agent'])} → {esc(h['to_agent'])}</p>
-                <p>{esc((h.get('description') or '')[:180])}</p>
-                <small>Updated {esc(h['updated_at'])}</small>
-                <div class='action-row'>
-                  <form method='post' action='/ui/handoffs/{esc(h['id'])}/status{token_suffix}'><input type='hidden' name='status' value='accepted'><button>Accept</button></form>
-                  <form method='post' action='/ui/handoffs/{esc(h['id'])}/status{token_suffix}'><input type='hidden' name='status' value='blocked'><input name='note' placeholder='blocker note'><button class='warn'>Block</button></form>
-                  <form method='post' action='/ui/handoffs/{esc(h['id'])}/status{token_suffix}'><input type='hidden' name='status' value='completed'><button class='ok'>Complete</button></form>
-                  <form method='post' action='/ui/handoffs/{esc(h['id'])}/status{token_suffix}'><input type='hidden' name='status' value='cancelled'><button class='ghost'>Cancel</button></form>
-                </div>
-              </div>
-            </article>
-            """
-            for h in handoffs
-        )
-        quick_message_form = f"""
-        <form class='compose' method='post' action='/ui/send{token_suffix}'>
-          <h2>Send Message</h2>
-          <div class='form-grid'>
-            <label>From<input name='from_agent' value='{esc(actor if actor != 'bootstrap' else 'codex')}'></label>
-            <label>To<input name='to_agent' placeholder='forge, hermes, riff...'></label>
-            <label>Project<input name='project' value='{esc(project_filter or 'hmwas')}'></label>
-            <label>Priority<select name='priority'><option>normal</option><option>high</option><option>urgent</option><option>low</option></select></label>
-          </div>
-          <label>Subject<input name='subject' placeholder='Short useful subject'></label>
-          <label>Body<textarea name='body' placeholder='Write the work, the blocker, or the receipt.'></textarea></label>
-          <button type='submit'>Send</button>
-        </form>
-        """
-        handoff_form = f"""
-        <form class='compose' method='post' action='/ui/handoffs{token_suffix}'>
-          <h2>Create Handoff</h2>
-          <div class='form-grid'>
-            <label>From<input name='from_agent' value='{esc(actor if actor != 'bootstrap' else 'codex')}'></label>
-            <label>To<input name='to_agent' placeholder='owner agent'></label>
-            <label>Project<input name='project' value='{esc(project_filter or 'hmwas')}'></label>
-            <label>Priority<select name='priority'><option>normal</option><option>high</option><option>urgent</option><option>low</option></select></label>
-          </div>
-          <label>Title<input name='title' placeholder='Exact ownership transfer'></label>
-          <label>Description<textarea name='description' placeholder='What needs doing, what is blocked, and what not to touch.'></textarea></label>
-          <label>Expected output<input name='expected_output' placeholder='commit, audit doc, test result, etc.'></label>
-          <button type='submit'>Create Handoff</button>
-        </form>
-        """
-        project_chips = "".join(
-            f"<a class='chip' href='/dashboard{token_suffix}&project={esc(project)}'>{esc(project)}</a>"
-            for project in ["hmwas", "groove-social", "paperclip", "infra"]
-        )
-        html = f"""<!doctype html>
-<html>
-<head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta http-equiv='refresh' content='30'>
-  <title>Intercom 2.0 Mission Control</title>
-  <style>
-    :root {{
-      --ink: #182017;
-      --cream: #f4eddc;
-      --paper: rgba(255, 251, 239, .82);
-      --line: rgba(30, 48, 35, .14);
-      --moss: #34583f;
-      --moss-2: #6f8f5f;
-      --copper: #b76538;
-      --marigold: #e2b14b;
-      --rose: #c14f45;
-      --sky: #5f8ea3;
-      --shadow: 0 24px 80px rgba(42, 35, 19, .18);
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      color: var(--ink);
-      font-family: Avenir Next, Optima, Trebuchet MS, sans-serif;
-      background:
-        radial-gradient(circle at 12% 18%, rgba(226, 177, 75, .38), transparent 27%),
-        radial-gradient(circle at 82% 8%, rgba(95, 142, 163, .28), transparent 29%),
-        linear-gradient(135deg, #f7f0dc 0%, #d8dfc5 46%, #aabf9a 100%);
-      min-height: 100vh;
-    }}
-    body::before {{
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      opacity: .28;
-      background-image: linear-gradient(rgba(24,32,23,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(24,32,23,.05) 1px, transparent 1px);
-      background-size: 34px 34px;
-      mask-image: radial-gradient(circle at center, black, transparent 82%);
-    }}
-    .shell {{ width: min(1440px, calc(100vw - 38px)); margin: 0 auto; padding: 28px 0 52px; position: relative; }}
-    .hero {{
-      border: 1px solid var(--line);
-      background: linear-gradient(135deg, rgba(255,251,239,.88), rgba(243,236,215,.66));
-      border-radius: 34px;
-      padding: 28px;
-      box-shadow: var(--shadow);
-      display: grid;
-      grid-template-columns: 1.3fr .7fr;
-      gap: 20px;
-      overflow: hidden;
-      position: relative;
-    }}
-    .hero::after {{ content: ""; position: absolute; width: 420px; height: 420px; right: -160px; top: -180px; background: radial-gradient(circle, rgba(183,101,56,.28), transparent 66%); }}
-    .eyebrow {{ text-transform: uppercase; letter-spacing: .18em; color: var(--copper); font-weight: 800; font-size: 12px; }}
-    h1 {{ font-family: Georgia, Charter, serif; font-size: clamp(38px, 6vw, 82px); line-height: .88; margin: 12px 0 16px; letter-spacing: -.07em; max-width: 820px; }}
-    .hero p {{ font-size: 18px; line-height: 1.55; max-width: 680px; margin: 0; color: rgba(24,32,23,.74); }}
-    .status-panel {{ align-self: stretch; border-radius: 26px; padding: 20px; background: #1f3025; color: #f8f1dd; box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); z-index: 1; }}
-    .status-panel strong {{ display: block; font-size: 13px; text-transform: uppercase; letter-spacing: .14em; color: #d9bd76; }}
-    .status-panel code {{ display: block; margin-top: 12px; color: #d8f2c7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .pulse {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #9ae66e; box-shadow: 0 0 0 8px rgba(154,230,110,.14); margin-right: 8px; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; margin: 20px 0; }}
-    .metric-card {{ background: rgba(255,251,239,.78); border: 1px solid var(--line); border-radius: 24px; padding: 18px; box-shadow: 0 14px 40px rgba(42,35,19,.12); }}
-    .metric-label {{ color: rgba(24,32,23,.56); text-transform: uppercase; letter-spacing: .12em; font-size: 11px; font-weight: 900; }}
-    .metric-value {{ font-family: Georgia, Charter, serif; font-size: 48px; line-height: 1; margin-top: 10px; }}
-    .metric-rule {{ height: 5px; border-radius: 99px; background: linear-gradient(90deg, var(--moss), var(--marigold)); margin-top: 16px; }}
-    .grid {{ display: grid; grid-template-columns: .9fr 1.1fr; gap: 18px; align-items: start; }}
-    .panel {{ background: var(--paper); border: 1px solid var(--line); border-radius: 28px; padding: 20px; box-shadow: 0 18px 60px rgba(42,35,19,.14); backdrop-filter: blur(14px); }}
-    .panel h2 {{ margin: 0 0 14px; font-family: Georgia, Charter, serif; font-size: 28px; letter-spacing: -.04em; }}
-    .agent-list {{ display: grid; gap: 10px; }}
-    .agent-card {{ display: grid; grid-template-columns: 48px 1fr auto; gap: 12px; align-items: center; padding: 12px; border-radius: 20px; background: rgba(255,255,255,.42); border: 1px solid rgba(30,48,35,.1); }}
-    .agent-avatar {{ width: 48px; height: 48px; border-radius: 16px; background: linear-gradient(135deg, var(--moss), var(--sky)); color: white; display: grid; place-items: center; font-weight: 900; }}
-    .agent-card h3, .handoff-item h3 {{ margin: 0; font-size: 17px; }}
-    .agent-card p, .handoff-item p, .feed-item p {{ margin: 4px 0; color: rgba(24,32,23,.66); }}
-    small, footer {{ color: rgba(24,32,23,.48); }}
-    .badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 5px 9px; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: .08em; background: rgba(52,88,63,.12); color: var(--moss); white-space: nowrap; }}
-    .handoff-blocked, .agent-inactive, .message-failed {{ background: rgba(193,79,69,.13); color: var(--rose); }}
-    .handoff-completed {{ background: rgba(52,88,63,.14); color: var(--moss); }}
-    .handoff-accepted {{ background: rgba(226,177,75,.2); color: #7a5310; }}
-    .handoff-item, .feed-item {{ display: grid; gap: 10px; padding: 14px; border-radius: 20px; border: 1px solid rgba(30,48,35,.1); background: rgba(255,255,255,.42); margin-bottom: 10px; }}
-    .handoff-item {{ grid-template-columns: auto 1fr; }}
-    .feed-top {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
-    .route {{ font-weight: 800; color: var(--moss); }}
-    .route span {{ color: rgba(24,32,23,.42); font-weight: 500; }}
-    .feed-item footer {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; border-top: 1px solid rgba(30,48,35,.1); padding-top: 10px; }}
-    .chips {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 0; }}
-    .chip {{ color: var(--ink); text-decoration: none; border: 1px solid rgba(30,48,35,.14); background: rgba(255,251,239,.62); padding: 9px 12px; border-radius: 999px; font-weight: 900; font-size: 13px; }}
-    .forms {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }}
-    .compose {{ border: 1px solid rgba(30,48,35,.1); background: rgba(255,255,255,.36); border-radius: 22px; padding: 14px; }}
-    .compose h2 {{ font-size: 22px; margin-bottom: 10px; }}
-    label {{ display: grid; gap: 5px; color: rgba(24,32,23,.58); font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: .08em; }}
-    input, textarea, select {{ width: 100%; border: 1px solid rgba(30,48,35,.14); background: rgba(255,251,239,.88); color: var(--ink); border-radius: 14px; padding: 10px 11px; font: inherit; text-transform: none; letter-spacing: 0; }}
-    textarea {{ min-height: 92px; resize: vertical; }}
-    .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }}
-    button {{ border: 0; border-radius: 999px; background: var(--moss); color: #fff8e5; padding: 9px 13px; font-weight: 900; cursor: pointer; box-shadow: 0 8px 22px rgba(52,88,63,.22); }}
-    button.warn {{ background: var(--rose); }}
-    button.ok {{ background: var(--moss-2); color: #142016; }}
-    button.ghost {{ background: rgba(24,32,23,.08); color: var(--ink); box-shadow: none; }}
-    .action-row {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }}
-    .action-row form {{ display: flex; gap: 6px; align-items: center; }}
-    .action-row input {{ min-width: 160px; padding: 8px 10px; }}
-    @media (max-width: 980px) {{ .hero, .grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
-    @media (max-width: 980px) {{ .forms {{ grid-template-columns: 1fr; }} }}
-    @media (max-width: 560px) {{ .shell {{ width: min(100vw - 22px, 1440px); padding-top: 12px; }} .hero {{ padding: 20px; border-radius: 24px; }} .metrics, .form-grid {{ grid-template-columns: 1fr; }} }}
-  </style>
-</head>
-<body>
-  <div class='shell'>
-    <section class='hero'>
-      <div>
-        <div class='eyebrow'><span class='pulse'></span>Live Agent Office</div>
-        <h1>Intercom 2.0 Mission Control</h1>
-        <p>A calm command center for the basement robot company: handoffs, blockers, agent presence, and the receipts that prove work actually happened.</p>
-      </div>
-      <aside class='status-panel'>
-        <strong>Current Route</strong>
-        <code>Actor: {esc(actor)}</code>
-        <code>Project: {esc(project_filter or 'all')}</code>
-        <code>LAN: http://192.168.1.66:8777</code>
-        <code>Tailnet: http://100.65.136.76:8777</code>
-        <code>Refresh: 30 seconds</code>
-      </aside>
-    </section>
-    <nav class='chips'><a class='chip' href='/dashboard{token_suffix}'>All work</a>{project_chips}</nav>
-    <section class='metrics'>{cards}</section>
-    <section class='grid'>
-      <div class='panel'><h2>Agents</h2><div class='agent-list'>{agent_cards}</div></div>
-      <div>
-        <div class='panel forms'>{quick_message_form}{handoff_form}</div>
-        <div class='panel'><h2>Handoffs</h2>{handoff_rows or '<p>No handoffs yet.</p>'}</div>
-        <div class='panel' style='margin-top:18px'><h2>Message Feed</h2>{msg_rows or '<p>No messages yet.</p>'}</div>
-      </div>
-    </section>
-  </div>
-</body>
-</html>"""
-        body = html.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
 
 def main() -> None:

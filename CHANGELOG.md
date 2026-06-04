@@ -1,5 +1,27 @@
 # Intercom 2.0 Changelog
 
+## 2026-06-04
+
+- Removed dead code: `Intercom2Handler.render_dashboard` (290 lines, unreachable
+  since the portal rewrite). Server.py down from 2061 to 1766 lines.
+- Removed vestigial `app/server.py.bak`, `bin/create_agent_token.py.bak`,
+  `clients/intercom2_poll_once.py.bak`, and the empty `intercom.db` SQLite file.
+- Removed `state/project_assignments.json` sidecar. Coding/reviewing/default
+  owner are now first-class columns on `projects` (migration 008). The old JSON
+  is preserved at `state/project_assignments.json.migrated-2026-06-04` for
+  reference only.
+- Watchdog now also detects a stuck `intercom2-backup.timer` (latest backup
+  older than 48h). Posts an incident to codex with the same cooldown policy
+  as the agent-stale check. 4 new tests in `tests/test_backup_health.py`.
+- Fixed the rogue agents row whose name was the space-separated concatenation
+  of every agent (`'codex ember forge hermes lumino riff rook waverly'`,
+  inactive). One poller registered itself badly. Single-row delete.
+- Fixed the postgres-user permissions on the SMB share: `usermod -aG bridger
+  postgres` so the daily backup can write again. This was the underlying
+  cause of the 5-day backup gap that triggered this housekeeping pass.
+
+Test count: 48 → 52 (all green).
+
 ## 2026-05-15
 
 - Hardened autonomous pollers for launchd and systemd PATH differences.

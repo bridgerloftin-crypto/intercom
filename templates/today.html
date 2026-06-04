@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}Today · Intercom 2.0{% endblock %}
+{% block content %}
+
+<header class="page-header">
+  <h1 class="page-title">Good <em>{{ greeting|default("morning") }}</em>, {{ first_name|default("Bridger") }}.</h1>
+  <div class="page-subtitle">
+    <div><strong>{{ unread_count|default(0) }}</strong> unread</div>
+    <div><strong>{{ handoff_count|default(0) }}</strong> handoffs</div>
+    <div>{{ today_date|default("Sun 1 Jun") }}</div>
+  </div>
+</header>
+
+{# ──────────────────────────────────────────────────────────
+   §1 SYSTEM HEALTH
+   ────────────────────────────────────────────────────────── #}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">System</h2>
+      <span class="section-note">morning reading</span>
+    </header>
+    <div class="health-strip">
+      {% for cell in health %}
+      <div class="health-cell" data-state="{{ cell.state|default('ok') }}">
+        <div class="health-cell-label">{{ cell.label }}</div>
+        <div class="health-cell-value">{{ cell.value }}</div>
+        <div class="health-cell-detail">{{ cell.detail }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+{# ──────────────────────────────────────────────────────────
+   §2 ACTION QUEUE
+   ────────────────────────────────────────────────────────── #}
+<section class="section">
+  <div class="section-num">§2</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Action queue</h2>
+      <span class="section-count {% if unread_count > 5 %}is-warning{% endif %}">{{ unread_count|default(0) }}</span>
+      <span class="section-note">unread for you</span>
+    </header>
+    {% if action_queue %}
+    <ul class="action-list" id="action-queue">
+      {% for row in action_queue %}
+      <li class="action-row" data-thread="{{ row.thread_id|default(row.id) }}" data-state="{{ row.state|default('') }}">
+        <div class="action-meta">
+          <span>{{ row.project|default("—") }}</span>
+          <span>{{ row.age|default("—") }}</span>
+        </div>
+        <div class="action-from">{{ row.from|default("?") }}</div>
+        <div class="action-subject">
+          {{ row.subject|default("(no subject)") }}
+          {% if row.preview %}<em>— {{ row.preview|truncate(60) }}</em>{% endif %}
+        </div>
+        <div class="action-state {% if row.state in ('blocked', 'stale') %}is-{{ row.state }}{% endif %}">
+          {{ row.replies|default(0) }} repl{% if row.since_last %}<br><span style="font-size:10px">{{ row.since_last }}</span>{% endif %}
+        </div>
+        <a class="action-cta" href="/threads/{{ row.thread_id|default(row.id) }}">open</a>
+        <button class="action-ack" data-msg-id="{{ row.id }}" data-thread-id="{{ row.thread_id|default(row.id) }}" title="acknowledge">a</button>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">Nothing needs you right now. Quiet kitchen.</p>
+    {% endif %}
+  </div>
+</section>
+
+{# ──────────────────────────────────────────────────────────
+   §3 HANDOFFS YOU OWN
+   ────────────────────────────────────────────────────────── #}
+<section class="section">
+  <div class="section-num">§3</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Handoffs you own</h2>
+      <span class="section-count {% if blocked_handoffs > 0 %}is-warning{% endif %}">{{ handoff_count|default(0) }}</span>
+      <span class="section-note">{{ blocked_handoffs|default(0) }} blocked</span>
+    </header>
+    {% if handoffs %}
+    <ul class="handoff-list">
+      {% for h in handoffs %}
+      <li class="handoff-row" data-state="{{ h.status }}">
+        <span class="handoff-num">#{{ h.id|truncate(8) }}</span>
+        <div class="handoff-flow">
+          <span class="handoff-from">{{ h.from_agent }}</span><span class="arrow">→</span><span class="handoff-to">{{ h.to_agent }}</span>
+          <div class="handoff-title">{{ h.title }}</div>
+        </div>
+        <div class="handoff-state">{{ h.status }}</div>
+        <div class="handoff-age">{{ h.age|default("—") }}</div>
+        <a class="action-cta is-quiet" href="/handoffs/{{ h.id }}">open</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No open handoffs assigned to you.</p>
+    {% endif %}
+  </div>
+</section>
+
+{# ──────────────────────────────────────────────────────────
+   §4 PROJECTS
+   ────────────────────────────────────────────────────────── #}
+<section class="section">
+  <div class="section-num">§4</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Projects</h2>
+      <span class="section-count">{{ projects|length }}</span>
+      <span class="section-note">{{ projects|selectattr('state', 'equalto', 'blocked')|list|length }} blocked</span>
+    </header>
+    <div class="project-list">
+      {% for p in projects %}
+      <article class="project-row" data-state="{{ p.state|default('active') }}">
+        <header class="project-head">
+          <h3 class="project-name">{{ p.name }}</h3>
+          <span class="project-state">{{ p.state|default('active') }}</span>
+        </header>
+        <dl class="project-meta">
+          <div>
+            <dt>coding</dt>
+            <dd {% if not p.coding %}class="empty"{% endif %}>{{ p.coding|default("— unassigned —") }}</dd>
+          </div>
+          <div>
+            <dt>reviewing</dt>
+            <dd {% if not p.reviewing %}class="empty"{% endif %}>{{ p.reviewing|default("— unassigned —") }}</dd>
+          </div>
+          <div>
+            <dt>last commit</dt>
+            <dd><code>{{ p.last_commit|default("—") }}</code> · {{ p.last_commit_age|default("—") }}</dd>
+          </div>
+          <div>
+            <dt>unread for you</dt>
+            <dd>{{ p.unread_for_you|default(0) }}</dd>
+          </div>
+        </dl>
+        <div class="project-progress">
+          <div class="project-progress-fill" style="width: {{ p.completion|default(0) }}%"></div>
+        </div>
+        <div class="project-foot">
+          <span>{{ p.path|default("") }}</span>
+          <a href="/projects/{{ p.name }}">view →</a>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+{# ──────────────────────────────────────────────────────────
+   §5 AGENTS
+   ────────────────────────────────────────────────────────── #}
+<section class="section">
+  <div class="section-num">§5</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Agents</h2>
+      <span class="section-count">{{ agents|length }}</span>
+      <span class="section-note">{{ agents|selectattr('state', 'equalto', 'online')|list|length }} online</span>
+    </header>
+    <ul class="agent-list">
+      {% for a in agents %}
+      <li class="agent-row" data-state="{{ a.state }}">
+        <div class="agent-name">{{ a.name }}</div>
+        <div class="agent-status">{{ a.status|default("—") }}</div>
+        {% if a.current %}<div class="agent-current">{{ a.current }}</div>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+
+{% endblock %}

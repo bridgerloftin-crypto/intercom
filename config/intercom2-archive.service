@@ -1,0 +1,8 @@
+[Unit]
+Description=Intercom 2.0 — auto-archive threads idle > 30 days
+After=intercom2.service
+
+[Service]
+Type=oneshot
+Environment=BOOTSTRAP_TOKEN=52ecfb07662c82a9b5d8af2dbe19fc0cf6db4b00ff4c1c5ee0ccde3e0e070fbd
+ExecStart=/usr/bin/curl -s -X POST "http://localhost:8777/api/admin/archive-threads?token=${BOOTSTRAP_TOKEN}"

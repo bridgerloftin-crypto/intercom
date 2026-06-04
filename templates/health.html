@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Health · Intercom 2.0{% endblock %}
+{% block content %}
+
+<header class="page-header">
+  <h1 class="page-title">Health</h1>
+  <div class="page-subtitle">
+    <div>system diagnostics</div>
+    <div>live</div>
+  </div>
+</header>
+
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">System</h2>
+      <span class="section-note">live diagnostics</span>
+    </header>
+
+    <div class="health-grid">
+      {% for cell in health %}
+      <article class="health-cell" data-state="{{ cell.state }}">
+        <div class="health-cell-label">{{ cell.label }}</div>
+        <div class="health-cell-value">{{ cell.value }}</div>
+        {% if cell.detail %}<div class="health-cell-detail">{{ cell.detail }}</div>{% endif %}
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-num">§2</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Agents</h2>
+      <span class="section-count">{{ agents|length }}</span>
+      <span class="section-note">last seen</span>
+    </header>
+
+    <ul class="agent-grid">
+      {% for a in agents %}
+      <li class="agent-card" data-state="{{ a.state|default('offline') }}">
+        <div class="agent-card-name">{{ a.name }}</div>
+        <div class="agent-card-state">
+          <span class="state-dot state-{{ a.state|default('offline') }}"></span>
+          {{ a.state|default('offline') }}
+        </div>
+        <div class="agent-card-age">{{ a.age|default('—') }}</div>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+
+{% endblock %}

@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}New project · Intercom 2.0{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Register new project</h2>
+      <span class="section-note">add to routing + role assignments</span>
+    </header>
+
+    {% if query_string and 'error' in query_string %}
+    <div class="form-error">
+      {% if 'error=invalid_name' in query_string %}
+      That name didn't work — use letters, digits, hyphens, underscores (2-41 chars).
+      {% else %}
+      Something went wrong. Try again.
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <form class="new-project-form" method="post" action="/projects/new">
+      <div class="form-row">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" required
+               pattern="[A-Za-z][A-Za-z0-9_-]{1,40}"
+               value="{{ request_args.name|default('') }}"
+               placeholder="e.g. birddog">
+        <p class="form-hint">letters, digits, hyphens, underscores. we'll lowercase it. matches the agents table.</p>
+      </div>
+
+      <div class="form-row">
+        <label for="description">Description</label>
+        <textarea id="description" name="description" rows="2"
+                  placeholder="what is this project for">{{ request_args.description|default('') }}</textarea>
+      </div>
+
+      <div class="form-row">
+        <label for="default_owner">Default owner agent</label>
+        <input type="text" id="default_owner" name="default_owner"
+               value="{{ request_args.default_owner|default('') }}"
+               placeholder="e.g. forge">
+        <p class="form-hint">messages with this project and no explicit to_agent route here.</p>
+      </div>
+
+      <div class="form-row">
+        <label for="coding">Coding agent</label>
+        <input type="text" id="coding" name="coding"
+               value="{{ request_args.coding|default('') }}"
+               placeholder="e.g. forge">
+      </div>
+
+      <div class="form-row">
+        <label for="reviewing">Reviewing agent</label>
+        <input type="text" id="reviewing" name="reviewing"
+               value="{{ request_args.reviewing|default('') }}"
+               placeholder="e.g. codex">
+      </div>
+
+      <div class="form-actions">
+        <button type="submit">Register</button>
+        <a class="action-cta is-quiet" href="/projects">cancel</a>
+      </div>
+    </form>
+  </div>
+</section>
+{% endblock %}

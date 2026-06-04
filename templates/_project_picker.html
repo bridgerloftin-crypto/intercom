@@ -1,0 +1,26 @@
+<details class="project-picker" id="project-picker">
+  <summary>
+    <span>{{ current_project|default("all projects") }}</span>
+  </summary>
+  <div class="project-menu">
+    <div class="project-menu-header">
+      <span>Projects · {{ project_count|default(0) }}</span>
+      <span>{{ roles_summary|default("") }}</span>
+    </div>
+    <a href="/projects/all">
+      <span class="project-menu-name">all projects</span>
+      <span class="project-menu-path">/srv/agent-share/repos · /srv/agent-share</span>
+    </a>
+    {% for p in projects %}
+    <a href="/projects/{{ p.name }}">
+      <span class="project-menu-name">{{ p.name }}</span>
+      <span class="project-menu-path">{{ p.path }}</span>
+      <span class="project-menu-roles">
+        {% if p.coding %}<div>code · {{ p.coding }}</div>{% endif %}
+        {% if p.reviewing %}<div>review · {{ p.reviewing }}</div>{% endif %}
+      </span>
+    </a>
+    {% endfor %}
+    <a href="/projects/new" class="project-menu-new">+ register new project</a>
+  </div>
+</details>

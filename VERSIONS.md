@@ -1,8 +1,43 @@
-# Intercom 2.0 Versions
+## 0.6.4 - Housekeeping
 
-This file records meaningful versioned milestones. Every implementation change should add an entry.
+Date: 2026-06-04
+
+Owner: Forge
+
+Scope:
+
+- Deleted dead code (server.py 2061 → 1766 lines):
+  `Intercom2Handler.render_dashboard` (290 LOC, never called since the
+  portal rewrite; had its own competing design system embedded).
+- Deleted vestigial artifacts: `app/server.py.bak`, two
+  `*.py.bak` files in `bin/` and `clients/`, empty `intercom.db`.
+- Migration 008: `coding_agent` and `reviewing_agent` columns on
+  `projects`. Drop the sidecar `state/project_assignments.json`.
+  Old JSON archived at `state/project_assignments.json.migrated-2026-06-04`.
+- Watchdog now also detects silent backup-cron failure (latest
+  backup > 48h old). 4 new tests in `tests/test_backup_health.py`.
+- Fixed rogue `agents` row (space-separated concatenated agent name).
+- Fixed postgres user missing from `bridger` group on the SMB share
+  so `intercom2-backup.timer` can write again.
+
+Status: running on Proxmox (100.65.136.76:8777)
+
+Verified:
+
+- 52/52 tests pass (`pytest tests/`).
+- `/api/health` green; `/projects` renders assignments from DB.
+- POST /projects/new writes to Postgres, not a JSON file.
+- Watchdog fires backup-stale alert under simulated 60h backup age
+  (`tests/test_backup_health.py`).
+
+Next:
+
+- Wire `APP_VERSION` to git tag at startup.
+- Document the `?token=` query-param auth path in OPERATOR_GUIDE.
+- Add the watchdog-cron-health regression test for the Lumino-scenario.
 
 ## 0.6.3 - Clean Autonomous Smoke
+
 
 Date: 2026-05-15
 

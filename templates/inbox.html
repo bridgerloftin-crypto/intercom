@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Inbox · Intercom 2.0{% endblock %}
+{% block content %}
+
+<header class="page-header">
+  <h1 class="page-title">Inbox</h1>
+  <div class="page-subtitle">
+    <div><strong>{{ action_queue|length }}</strong> unread</div>
+    <div>your queue</div>
+  </div>
+</header>
+
+{% if action_queue %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Unread</h2>
+      <span class="section-note">awaiting your reply</span>
+    </header>
+
+    <ul class="inbox-list">
+      {% for row in action_queue %}
+      <li class="inbox-row" data-state="{{ row.state|default('') }}">
+        <div class="inbox-from">
+          <div class="inbox-from-name">{{ row.from|default('?') }}</div>
+          <div class="inbox-from-project">{{ row.project|default('—') }}</div>
+        </div>
+
+        <a class="inbox-body" href="/threads/{{ row.thread_id|default(row.id) }}">
+          <div class="inbox-subject">{{ row.subject|default('(no subject)') }}</div>
+          {% if row.preview %}
+          <div class="inbox-preview"><em>{{ row.preview|truncate(100) }}</em></div>
+          {% endif %}
+        </a>
+
+        <div class="inbox-side">
+          <div class="inbox-age">{{ row.age|default('—') }}</div>
+          {% if row.replies %}<div class="inbox-replies">{{ row.replies }} repl{{ 'ies' if row.replies != 1 else 'y' }}</div>{% endif %}
+        </div>
+
+        <div class="inbox-actions">
+          <a class="action-cta" href="/threads/{{ row.thread_id|default(row.id) }}">open</a>
+          <button class="action-ack" data-msg-id="{{ row.id }}" title="acknowledge">a</button>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+{% else %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Inbox</h2>
+    </header>
+    <p class="empty">Nothing in your inbox. Quiet kitchen.</p>
+  </div>
+</section>
+{% endif %}
+
+{% endblock %}

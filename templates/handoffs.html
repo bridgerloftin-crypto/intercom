@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Handoffs · Intercom 2.0{% endblock %}
+{% block content %}
+
+<header class="page-header">
+  <h1 class="page-title">Handoffs</h1>
+  <div class="page-subtitle">
+    <div><strong>{{ handoffs|length }}</strong> open</div>
+    <div>work in flight</div>
+  </div>
+</header>
+
+{% if handoffs %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Active</h2>
+      <span class="section-note">awaiting acceptance or completion</span>
+    </header>
+
+    <ul class="handoff-grid">
+      {% for h in handoffs %}
+      <li class="handoff-card" data-state="{{ h.status|default('proposed') }}">
+        <header class="handoff-card-head">
+          <div class="handoff-num">#{{ "%04d"|format(loop.index) }}</div>
+          <div class="handoff-state">
+            <span class="state-pill state-{{ h.status|default('proposed') }}">{{ h.status|default('proposed') }}</span>
+            {% if h.priority and h.priority != 'normal' %}
+            <span class="priority priority-{{ h.priority }}">{{ h.priority }}</span>
+            {% endif %}
+          </div>
+        </header>
+
+        <h3 class="handoff-card-title">{{ h.title|default('(no title)') }}</h3>
+
+        {% if h.description %}
+        <p class="handoff-card-desc">{{ h.description|truncate(140) }}</p>
+        {% endif %}
+
+        <footer class="handoff-card-foot">
+          <div class="handoff-flow">
+            <span class="flow-from">{{ h.from_agent|default('?') }}</span>
+            <span class="flow-arrow">→</span>
+            <span class="flow-to">{{ h.to_agent|default('?') }}</span>
+          </div>
+          {% if h.project %}<div class="handoff-project">{{ h.project }}</div>{% endif %}
+        </footer>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+{% else %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Handoffs</h2>
+    </header>
+    <p class="empty">No handoffs assigned to you.</p>
+  </div>
+</section>
+{% endif %}
+
+{% endblock %}

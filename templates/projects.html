@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Projects · Intercom 2.0{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-num">§1</div>
+  <div>
+    <header class="section-head">
+      <h2 class="section-title">Projects</h2>
+      <span class="section-count">{{ projects|length }}</span>
+      <span class="section-note">canonical repos</span>
+    </header>
+    <ul class="project-list">
+      {% for p in projects %}
+      <li class="project-card">
+        <div class="project-name">{{ p.name }}</div>
+        <div class="project-path">{{ p.path }}</div>
+        <div class="project-roles">
+          <span class="role">code <strong>{{ p.coding|default("—") }}</strong></span>
+          <span class="role">review <strong>{{ p.reviewing|default("—") }}</strong></span>
+          <span class="role">last commit <strong>{{ p.last_commit_age|default("—") }}</strong></span>
+          <span class="role">completion <strong>{{ p.completion|default(0) }}%</strong></span>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+{% endblock %}
