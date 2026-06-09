@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Poll Intercom 2.0 once and hand unread messages to a local agent runtime."""
+"""Poll Intercom 2.0 once and hand unread messages to a local agent runtime.
+
+This is the fallback/sweep client. The primary client is intercom2_listen.py (SSE).
+This script runs on a timer as a safety net: catches any messages that arrived
+while SSE was down, and handles agents that don't run the SSE listener.
+
+Usage:
+    INTERCOM_AGENT=billy INTERCOM2_TOKEN=<token> python3 intercom2_poll_once.py
+
+Environment variables:
+    INTERCOM_AGENT          Agent name (required)
+    INTERCOM2_URL           Intercom 2 base URL (default: http://100.65.136.76:8777)
+    INTERCOM2_TOKEN Auth token (required)
+    INTERCOM2_RUNNER        Runner: openclaw|hermes|echo (default: echo)
+    INTERCOM2_WORKDIR Working directory (default: $HOME)
+    INTERCOM2_STATE_DIR     State directory (default: $HOME/.intercom2)
+    INTERCOM2_MAX_MESSAGES  Max messages per poll (default: 3)
+    INTERCOM2_RUNNER_TIMEOUT Agent timeout seconds (default: 600)
+    INTERCOM2_CIRCUIT_MAX_FAILURES  Failures before cooldown (default: 3)
+    INTERCOM2_CIRCUIT_COOLDOWN      Cooldown seconds (default: 900 = 15min)
+    INTERCOM2_POLL_FALLBACK  If "0", exit0 immediately without polling (default: 1)
+"""
 
 from __future__ import annotations
 
@@ -41,7 +62,8 @@ STATE_DIR = Path(os.environ.get("INTERCOM2_STATE_DIR", str(Path.home() / ".inter
 MAX_MESSAGES = int(os.environ.get("INTERCOM2_MAX_MESSAGES", "3"))
 TIMEOUT = int(os.environ.get("INTERCOM2_RUNNER_TIMEOUT", "600"))
 CIRCUIT_MAX_FAILURES = int(os.environ.get("INTERCOM2_CIRCUIT_MAX_FAILURES", "3"))
-CIRCUIT_COOLDOWN_SECONDS = int(os.environ.get("INTERCOM2_CIRCUIT_COOLDOWN", "900"))  # 15min
+CIRCUIT_COOLDOWN_SECONDS = int(os.environ.get("INTERCOM2_CIRCUIT_COOLDOWN", "900"))
+POLL_FALLBACK = os.environ.get("INTERCOM2_POLL_FALLBACK", "1").strip() in ("1", "true", "yes")
 
 
 def circuit_state_path() -> Path:
@@ -112,7 +134,7 @@ def load_seen() -> set[int]:
 
 def save_seen(seen: set[int]) -> None:
     path = STATE_DIR / f"{AGENT}-seen.json"
-    path.write_text(json.dumps(sorted(seen)[-500:], indent=2))
+    path.write_text(json.dumps(sorted(seen)[-5000:], indent=2))
 
 
 def extract_text(stdout: str) -> str:
@@ -271,6 +293,11 @@ def main() -> int:
     if not TOKEN:
         print("INTERCOM2_TOKEN is required", file=sys.stderr)
         return 2
+
+    if not POLL_FALLBACK:
+        # Disabled: exit cleanly (SSE listener is primary)
+        print(json.dumps({"ok": True, "agent": AGENT, "skipped": "poll_fallback_disabled"}))
+        return 0
 
     if circuit_open():
         state = load_circuit()

@@ -1,0 +1,20 @@
+[Unit]
+Description=Intercom 2.0 SSE listener for %I
+After=network-online.target intercom2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=INTERCOM2_ROOT=/srv/agent-share/intercom2
+EnvironmentFile=/srv/agent-share/intercom2/config/intercom2.env
+ExecStart=/usr/bin/python3 /srv/agent-share/intercom2/clients/intercom2_listen.py
+Restart=always
+RestartSec=3
+User=root
+Group=agents
+UMask=0007
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
