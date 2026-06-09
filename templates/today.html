@@ -11,9 +11,7 @@
   </div>
 </header>
 
-{# ──────────────────────────────────────────────────────────
-   §1 SYSTEM HEALTH
-   ────────────────────────────────────────────────────────── #}
+{# §1 SYSTEM HEALTH #}
 <section class="section">
   <div class="section-num">§1</div>
   <div>
@@ -33,9 +31,7 @@
   </div>
 </section>
 
-{# ──────────────────────────────────────────────────────────
-   §2 ACTION QUEUE
-   ────────────────────────────────────────────────────────── #}
+{# §2 ACTION QUEUE #}
 <section class="section">
   <div class="section-num">§2</div>
   <div>
@@ -71,9 +67,7 @@
   </div>
 </section>
 
-{# ──────────────────────────────────────────────────────────
-   §3 HANDOFFS YOU OWN
-   ────────────────────────────────────────────────────────── #}
+{# §3 HANDOFFS YOU OWN #}
 <section class="section">
   <div class="section-num">§3</div>
   <div>
@@ -103,9 +97,7 @@
   </div>
 </section>
 
-{# ──────────────────────────────────────────────────────────
-   §4 PROJECTS
-   ────────────────────────────────────────────────────────── #}
+{# §4 PROJECTS #}
 <section class="section">
   <div class="section-num">§4</div>
   <div>
@@ -152,19 +144,22 @@
   </div>
 </section>
 
-{# ──────────────────────────────────────────────────────────
-   §5 AGENTS
-   ────────────────────────────────────────────────────────── #}
+{# §5 AGENTS — hide offline/stale agents from view #}
+{% set visible_agents = [] %}
+{% for a in agents %}
+{% if a.state != 'offline' %}{% do visible_agents.append(a) %}{% endif %}
+{% endfor %}
+{% if visible_agents %}
 <section class="section">
   <div class="section-num">§5</div>
   <div>
     <header class="section-head">
       <h2 class="section-title">Agents</h2>
-      <span class="section-count">{{ agents|length }}</span>
-      <span class="section-note">{{ agents|selectattr('state', 'equalto', 'online')|list|length }} online</span>
+      <span class="section-count">{{ visible_agents|length }}</span>
+      <span class="section-note">{{ visible_agents|selectattr('state', 'equalto', 'online')|list|length }} online</span>
     </header>
     <ul class="agent-list">
-      {% for a in agents %}
+      {% for a in visible_agents %}
       <li class="agent-row" data-state="{{ a.state }}">
         <div class="agent-name">{{ a.name }}</div>
         <div class="agent-status">{{ a.status|default("—") }}</div>
@@ -174,5 +169,6 @@
     </ul>
   </div>
 </section>
+{% endif %}
 
 {% endblock %}
